@@ -187,10 +187,14 @@ struct WatchArgs {
 }
 
 fn default_config() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("config.yaml")
+    std::env::var_os("SDU_INFOHELPER_CONFIG")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("config.yaml"))
 }
 fn default_history() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(".local/electricity/history.sqlite3")
+    std::env::var_os("SDU_INFOHELPER_HISTORY")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(".local/electricity/history.sqlite3"))
 }
 
 fn ensure_parent(path: &std::path::Path) -> Result<(), String> {
@@ -208,6 +212,13 @@ fn secure_history(path: &std::path::Path) -> Result<(), String> {
             .map_err(|_| "无法设置历史文件权限。".to_owned())?;
     }
     Ok(())
+}
+
+fn failure_flags(error: &QueryError) -> (bool, bool) {
+    let needs_login_attention =
+        matches!(error, QueryError::Authentication | QueryError::AuthFlow(_));
+    let fatal = needs_login_attention || matches!(error, QueryError::Config(_));
+    (fatal, needs_login_attention)
 }
 
 fn event(args: &QueryArgs) -> (Event, bool, bool) {
@@ -234,8 +245,7 @@ fn event(args: &QueryArgs) -> (Event, bool, bool) {
     match result {
         Ok(event) => (event, false, false),
         Err(error) => {
-            let auth = matches!(error, QueryError::Authentication);
-            let fatal = auth || matches!(error, QueryError::Config(_) | QueryError::AuthFlow(_));
+            let (fatal, auth) = failure_flags(&error);
             let mut failure = Event::failure(&error);
             failure.location = target;
             (failure, fatal, auth)
@@ -519,5 +529,19 @@ fn main() -> ExitCode {
             eprintln!("{error}");
             ExitCode::FAILURE
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn second_factor_requirement_stops_watch_and_requests_attention() {
+        assert_eq!(
+            failure_flags(&QueryError::AuthFlow("需要二次验证")),
+            (true, true)
+        );
+        assert_eq!(failure_flags(&QueryError::Network), (false, false));
     }
 }

@@ -11,12 +11,15 @@
 
 2026-09-29 已实测宿舍目录、跨房间查询、CAS 首次授信、后续免短信登录，
 并取得真实 refresh_token。主动刷新后再次读取宿舍电量成功。
-空调查询基于既有实现和已记录协议，本次重构尚未用本机空调目标做真实查询。
+同日使用本机配置分别完成宿舍普通用电和空调用电 CLI 真实查询。
 
 ## 安装和配置
 
 使用已有 Rust 1.88+、C 编译器、OpenSSL 开发库及 pkg-config 构建。脚本把 Cargo 缓存放在 `.cache/cargo`、
 编译结果放在 `target`，无需安装 Python、Miniforge、ADB 或代理到系统。
+也可从 GitHub Release 下载 Linux、Windows、macOS CLI 压缩包，或使用发布到
+GHCR 与 Docker Hub 的 Linux Docker 镜像；
+构建和发布目标见 [发布说明](docs/release.md)。
 
 ```bash
 bash scripts/build.sh
@@ -31,6 +34,10 @@ bash scripts/electricity.sh auth probe
 [迁移说明](docs/migration.md)。
 `config.yaml`、`.local`、旧抓包与 APK 均被 Git 忽略。
 账号密码只在本机配置；不要放到命令参数、日志或聊天里。
+直接运行二进制时，默认从当前工作目录读取 `config.yaml`，并将历史写入
+`.local/electricity/history.sqlite3`。可用 `--config`、`--history` 或
+`SDU_INFOHELPER_CONFIG`、`SDU_INFOHELPER_HISTORY` 指定位置。
+`scripts/electricity.sh` 会先切换到项目目录；Windows 使用 `.exe` 直接运行。
 
 首次登录宿舍平台：
 
@@ -124,10 +131,7 @@ fn main() -> Result<(), QueryError> {
 ## 开发验证
 
 ```bash
-source scripts/local-env.sh
-cargo fmt --check
-cargo test --locked
-cargo clippy --locked --all-targets -- -D warnings
+bash scripts/check.sh
 ```
 
 本地分析工具、APK 和抓包属于调查资料，正常查询不会使用它们。
