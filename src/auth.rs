@@ -210,10 +210,14 @@ fn lock(path: &Path) -> Result<fs::File, QueryError> {
     Ok(file)
 }
 
-fn credentials(settings: &Settings, config_path: &Path) -> Result<Credentials, QueryError> {
-    let mut credentials = settings.cas.clone().ok_or(QueryError::AuthFlow(
-        "请在本机 config.yaml 配置 cas 账号密码。",
-    ))?;
+fn credentials(config_path: &Path) -> Result<Credentials, QueryError> {
+    // Re-read under the authentication lock: another process may have initialized
+    // the device ID while this caller was waiting. Replacing it would lose trust.
+    let mut credentials = Settings::load(config_path)?
+        .cas
+        .ok_or(QueryError::AuthFlow(
+            "请在本机 config.yaml 配置 cas 账号密码。",
+        ))?;
     credentials.validate()?;
     if let Some(id) = credentials.device_id.as_ref() {
         if id.len() < 32 || hex::decode(id).is_err() {
@@ -282,7 +286,7 @@ fn cas_token(
     timeout: Duration,
     options: LoginOptions,
 ) -> Result<TokenCache, QueryError> {
-    let credentials = credentials(settings, path)?;
+    let credentials = credentials(path)?;
     let client = cas::client(timeout)?;
     let response = cas::login(&client, cas::DORM_ENTRY, &credentials, options)?;
     let url = response.url().clone();
@@ -653,7 +657,7 @@ pub fn aircon_session(
     let settings = Settings::load(path)?;
     settings.aircon.selected()?;
     let _lock = lock(&settings.cache_path(path))?;
-    let credentials = credentials(&settings, path)?;
+    let credentials = credentials(path)?;
     let client = cas::client(timeout)?;
     cas::login(&client, cas::AIRCON_ENTRY, &credentials, options)?;
     Ok((client, settings.aircon))
@@ -662,6 +666,20 @@ pub fn aircon_session(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn device_initialization_is_stable_and_preserves_credentials() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.yaml");
+        secure_write(&path,b"cas:\n  username: test-account\n  password: 'test:password#value'\n  device_id: null\nextra: retained\n").unwrap();
+        let first = credentials(&path).unwrap();
+        let second = credentials(&path).unwrap();
+        assert_eq!(first.device_id, second.device_id);
+        assert_eq!(second.username, "test-account");
+        assert_eq!(second.password, "test:password#value");
+        let saved: serde_yaml::Value = serde_yaml::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert_eq!(saved["extra"].as_str(), Some("retained"));
+    }
 
     #[test]
     fn sso_component_uses_the_authorization_after_the_sso_marker() {
@@ -779,6 +797,7 @@ mod tests {
     fn expired_token_without_credentials_requires_local_login_and_is_preserved() {
         let dir = tempfile::tempdir().unwrap();
         let config_path = dir.path().join("config.yaml");
+        secure_write(&config_path, b"cas: null\n").unwrap();
         let settings = Settings::default();
         let old = TokenCache::from_response(
             &serde_json::json!({"access_token":"old-access","expires_in":1}),
