@@ -38,15 +38,15 @@ Linux 桌面；服务器上查询结果、错误和提醒可由服务管理器�
 
 Docker Hub 仓库名为 `winstonmeursault/sdu-infohelper`。Docker Hub 要求仓库名
 使用小写字母，所以镜像名不能写成 `SDU-InfoHelper`。以下示例使用 GHCR 镜像；
-也可将镜像地址换成 `winstonmeursault/sdu-infohelper:v0.1.0`。
+也可将镜像地址换成 `winstonmeursault/sdu-infohelper:v1.0.0`。
 
 ```bash
 docker run --rm --user "$(id -u):$(id -g)" \
-  -v "$PWD/data:/data" ghcr.io/winstonmeursault/sdu-infohelper:v0.1.0 check-config
+  -v "$PWD/data:/data" ghcr.io/winstonmeursault/sdu-infohelper:v1.0.0 check-config
 docker run --rm -it --user "$(id -u):$(id -g)" \
-  -v "$PWD/data:/data" ghcr.io/winstonmeursault/sdu-infohelper:v0.1.0 auth login --trust-device
+  -v "$PWD/data:/data" ghcr.io/winstonmeursault/sdu-infohelper:v1.0.0 auth login --trust-device
 docker run --rm --user "$(id -u):$(id -g)" \
-  -v "$PWD/data:/data" ghcr.io/winstonmeursault/sdu-infohelper:v0.1.0 query --json
+  -v "$PWD/data:/data" ghcr.io/winstonmeursault/sdu-infohelper:v1.0.0 query --json
 ```
 
 首次运行前在宿主机的 `data/config.yaml` 填好配置。自动生成的设备 ID 会写回
