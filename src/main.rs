@@ -204,13 +204,15 @@ fn ensure_parent(path: &std::path::Path) -> Result<(), String> {
     Ok(())
 }
 
+#[cfg(unix)]
 fn secure_history(path: &std::path::Path) -> Result<(), String> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(path, fs::Permissions::from_mode(0o600))
-            .map_err(|_| "无法设置历史文件权限。".to_owned())?;
-    }
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(path, fs::Permissions::from_mode(0o600))
+        .map_err(|_| "无法设置历史文件权限。".to_owned())
+}
+
+#[cfg(not(unix))]
+fn secure_history(_path: &std::path::Path) -> Result<(), String> {
     Ok(())
 }
 
