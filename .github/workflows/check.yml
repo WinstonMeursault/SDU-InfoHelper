@@ -1,0 +1,33 @@
+name: Check
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_HOME: ${{ github.workspace }}/.cache/cargo
+  CARGO_TARGET_DIR: ${{ github.workspace }}/target
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+      - name: Install Python verification dependencies
+        run: python -m pip install httpx==0.28.1 mitmproxy==12.2.3 'anyio<4.15'
+      - name: Test Python capture import and query handling
+        run: python -m unittest discover -s tests
+      - name: Prepare Rust toolchain
+        run: rustup toolchain install stable --profile minimal --component rustfmt --component clippy
+      - name: Check Rust formatting
+        run: cargo +stable fmt --check
+      - name: Test Rust
+        run: cargo +stable test --locked
+      - name: Check Rust diagnostics
+        run: cargo +stable clippy --locked --all-targets -- -D warnings

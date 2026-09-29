@@ -1,0 +1,18 @@
+{
+  "schema_version": 1,
+  "url": "https://mcard.sdu.edu.cn/charge/feeitem/getThirdData",
+  "form": {
+    "feeitemid": "411",
+    "type": "IEC",
+    "level": "4",
+    "campus": "<校区值>",
+    "building": "<楼栋值>",
+    "floor": "<楼层值>",
+    "room": "<房间值>"
+  },
+  "headers": {
+    "synjones-auth": "bearer <TOKEN>",
+    "accept": "application/json, text/plain, */*",
+    "origin": "https://mcard.sdu.edu.cn"
+  }
+}

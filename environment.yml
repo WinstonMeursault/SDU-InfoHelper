@@ -1,0 +1,11 @@
+channels:
+  - conda-forge
+dependencies:
+  - python=3.12
+  - pip
+  - openjdk=17
+  - pip:
+      - httpx==0.28.1
+      - mitmproxy==12.2.3
+      # mitmproxy 12 requires typing-extensions <=4.14; anyio 4.15 needs >=4.16.
+      - anyio<4.15
