@@ -1,5 +1,6 @@
 use anyhow::{bail, Context, Result};
 use md5::{Digest, Md5};
+use rand::{rngs::OsRng, RngCore};
 use reqwest::blocking::Client;
 use scraper::{ElementRef, Html, Selector};
 use serde::Deserialize;
@@ -11,6 +12,7 @@ use cas_des::encrypt as cas_encrypt;
 
 const SERVICE: &str = "https://gyktgd.wh.sdu.edu.cn/dianbiao/AuthServlet.se";
 const CAS_LOGIN: &str = "https://pass.sdu.edu.cn/cas/login";
+const BALANCE_PATH: &str = "/dianbiao/chongzhi.jsp";
 
 #[derive(Deserialize)]
 struct Config {
@@ -24,14 +26,25 @@ struct Config {
 #[derive(Deserialize)]
 struct RoomConfig {
     building: Option<u16>,
+    floor: Option<u16>,
     room: Option<u16>,
 }
 
 impl Config {
-    fn selected_aircon(&self) -> Result<Option<(u16, u16)>> {
+    fn selected_aircon(&self) -> Result<Option<(u16, u16, u16)>> {
         match self.aircon.as_ref().map(|room| (room.building, room.room)) {
             None | Some((None, None)) => Ok(None),
-            Some((Some(building), Some(room))) => Ok(Some((building, room))),
+            Some((Some(building), Some(room))) => {
+                let floor = self
+                    .aircon
+                    .as_ref()
+                    .and_then(|target| target.floor)
+                    .unwrap_or(room / 100);
+                if building == 0 || floor == 0 || room == 0 {
+                    bail!("aircon 中的公寓、楼层和房间号必须大于 0");
+                }
+                Ok(Some((building, floor, room)))
+            }
             Some(_) => bail!("aircon.building 和 aircon.room 必须同时填写"),
         }
     }
@@ -41,6 +54,7 @@ impl Config {
 struct Credentials {
     username: String,
     password: String,
+    device_id: Option<String>,
 }
 
 fn main() -> Result<()> {
@@ -58,13 +72,21 @@ fn main() -> Result<()> {
         );
         return Ok(());
     }
-    let (probe, sms) = match mode.as_deref() {
-        None => (false, false),
-        Some("--probe") => (true, false),
-        Some("--sms") => (false, true),
-        Some(_) => bail!("用法：cargo run [--probe|--check-config|--sms]"),
+    let (probe, sms, trust_device, json_output) = match mode.as_deref() {
+        None => (false, false, false, false),
+        Some("--probe") => (true, false, false, false),
+        Some("--sms") => (false, true, false, false),
+        Some("--trust-device") => (false, true, true, false),
+        Some("--json") => (false, false, false, true),
+        Some(_) => bail!("用法：cargo run [--probe|--check-config|--sms|--trust-device|--json]"),
     };
-    let config = if probe { None } else { Some(load_config()?) };
+    let config = if probe {
+        None
+    } else {
+        let mut config = load_config()?;
+        ensure_device_id(&mut config)?;
+        Some(config)
+    };
     let selected_aircon = config
         .as_ref()
         .map(Config::selected_aircon)
@@ -107,7 +129,11 @@ fn main() -> Result<()> {
     ];
 
     // 页面 login.js 先向 /cas/device 验证账号和当前设备，成功后才提交表单。
-    let device_info = format!("SDU-InfoHelper Rust CLI; account={}", config.cas.username);
+    let device_info = format!(
+        "SDU-InfoHelper Rust CLI; account={}; id={}",
+        config.cas.username,
+        config.cas.device_id.as_deref().expect("已初始化设备标识")
+    );
     let device_hash = hex::encode(Md5::digest(device_info.as_bytes()));
     let device_url = login_page_url.join("device")?;
     let device_fields = [
@@ -139,9 +165,10 @@ fn main() -> Result<()> {
             &device_hash,
             &device_info,
             &config.cas.username,
+            trust_device,
         )?,
         "bind" => bail!(
-            "学号和密码已通过，但学校要求当前设备完成手机/扫码二次验证。请在本机运行 cargo run -- --sms，程序会向绑定手机发送验证码并在终端读取；验证码不会保存"
+            "学校要求当前设备完成手机/扫码二次验证。请在本机运行 cargo run -- --sms；若想授信此设备，运行 cargo run -- --trust-device"
         ),
         "validErr" | "notFound" => bail!("学校设备检查未接受学号或密码，请核对 config.yaml"),
         "mobileErr" => bail!("学校要求手机验证，但账号未绑定手机"),
@@ -172,14 +199,8 @@ fn main() -> Result<()> {
         );
     }
 
-    let page_html = if let Some((building, room)) = selected_aircon {
-        let floor = find_room_floor(&html, building, room)?;
-        let mut detail_url = result_url.join("/dianbiao/chongzhi.jsp")?;
-        detail_url
-            .query_pairs_mut()
-            .append_pair("gongyu", &building.to_string())
-            .append_pair("sushe", &room.to_string())
-            .append_pair("floor", &floor.to_string());
+    let page_html = if let Some((building, floor, room)) = selected_aircon {
+        let detail_url = balance_url(&result_url, building, floor, room)?;
         let detail_response = client
             .get(detail_url)
             .send()
@@ -192,12 +213,28 @@ fn main() -> Result<()> {
         if reading.building != building || reading.floor != floor || reading.room != room {
             bail!("查余电页面的房间与 config.yaml 不一致，已停止读取");
         }
-        println!(
-            "{} 公寓 {} 房间剩余电量：{} 度",
-            building, room, reading.remaining_kwh
-        );
+        if json_output {
+            println!(
+                "{}",
+                serde_json::json!({
+                    "service": "aircon",
+                    "building": reading.building,
+                    "floor": reading.floor,
+                    "room": reading.room,
+                    "remaining_kwh": reading.remaining_kwh,
+                })
+            );
+        } else {
+            println!(
+                "{} 公寓 {} 房间剩余电量：{} 度",
+                building, room, reading.remaining_kwh
+            );
+        }
         page
     } else {
+        if json_output {
+            bail!("--json 需要先填写 aircon.building 和 aircon.room");
+        }
         println!(
             "认证成功。请在 config.yaml 增加 aircon.building 和 aircon.room，以查询指定宿舍。"
         );
@@ -209,7 +246,9 @@ fn main() -> Result<()> {
             fs::create_dir_all(parent).context("无法创建输出目录")?;
         }
         fs::write(path, page_html).context("无法保存登录后页面")?;
-        println!("页面已保存：{}", path.display());
+        if !json_output {
+            println!("页面已保存：{}", path.display());
+        }
     }
     Ok(())
 }
@@ -226,6 +265,65 @@ fn load_config() -> Result<Config> {
         bail!("请先在 config.yaml 填写真实的学号和统一身份认证密码");
     }
     Ok(config)
+}
+
+fn ensure_device_id(config: &mut Config) -> Result<()> {
+    if let Some(id) = config.cas.device_id.as_deref() {
+        if hex::decode(id).is_err() || id.len() < 32 {
+            bail!("cas.device_id 必须是至少 32 位的十六进制字符串");
+        }
+        return Ok(());
+    }
+    let mut bytes = [0_u8; 16];
+    OsRng.fill_bytes(&mut bytes);
+    let id = hex::encode(bytes);
+    let path = Path::new("config.yaml");
+    let existing = fs::read_to_string(path)?;
+    let updated = insert_device_id(&existing, &id)?;
+    let temp = path.with_extension("yaml.tmp");
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(&temp).context("无法创建临时配置文件")?;
+    file.write_all(updated.as_bytes())?;
+    file.sync_all()?;
+    fs::rename(&temp, path).context("无法保存设备标识到 config.yaml")?;
+    config.cas.device_id = Some(id);
+    Ok(())
+}
+
+fn insert_device_id(existing: &str, id: &str) -> Result<String> {
+    let lines: Vec<&str> = existing.lines().collect();
+    let cas_start = lines
+        .iter()
+        .position(|line| line.trim_end() == "cas:")
+        .context("config.yaml 缺少顶层 cas: 字段，无法保存设备标识")?;
+    let cas_end = lines
+        .iter()
+        .enumerate()
+        .skip(cas_start + 1)
+        .find(|(_, line)| !line.is_empty() && !line.starts_with(' ') && !line.starts_with('#'))
+        .map(|(index, _)| index)
+        .unwrap_or(lines.len());
+    let existing_index =
+        (cas_start + 1..cas_end).find(|index| lines[*index].starts_with("  device_id:"));
+    let mut updated = String::new();
+    for (index, line) in lines.iter().enumerate() {
+        if existing_index == Some(index) {
+            updated.push_str(&format!("  device_id: \"{id}\"\n"));
+            continue;
+        }
+        updated.push_str(line);
+        updated.push('\n');
+        if existing_index.is_none() && index == cas_start {
+            updated.push_str(&format!("  device_id: \"{id}\"\n"));
+        }
+    }
+    Ok(updated)
 }
 
 struct LoginForm {
@@ -253,6 +351,7 @@ fn verify_sms(
     device_hash: &str,
     device_info: &str,
     username: &str,
+    trust_device: bool,
 ) -> Result<()> {
     let send_result: DeviceResult = client
         .post(device_url.clone())
@@ -285,14 +384,23 @@ fn verify_sms(
             ("m", "3"),
             ("u", username),
             ("c", code),
-            ("s", "0"),
+            ("s", if trust_device { "1" } else { "0" }),
         ])
         .send()
         .context("手机验证码验证请求失败")?
         .error_for_status()?
         .json()?;
     match verify_result.info.as_str() {
-        "ok" | "most" => Ok(()),
+        "ok" => {
+            if trust_device {
+                println!("学校已接受当前设备的授信请求。后续是否免短信将在下次登录时验证。");
+            }
+            Ok(())
+        }
+        "most" => {
+            println!("学校提示受信设备已达上限，已自动解除最早一台设备的授信。");
+            Ok(())
+        }
         "codeErr" => bail!("验证码错误"),
         "timeout" => bail!("验证码已超时"),
         "moreErr" => bail!("验证码错误次数过多，请重新获取"),
@@ -327,31 +435,21 @@ fn parse_login_form(html: &str, page_url: &Url) -> Result<LoginForm> {
     })
 }
 
-fn find_room_floor(html: &str, building: u16, room: u16) -> Result<u16> {
-    if building == 0 {
-        bail!("公寓号必须从 1 开始");
+fn balance_url(base: &Url, building: u16, floor: u16, room: u16) -> Result<Url> {
+    if base.host_str() != Some("gyktgd.wh.sdu.edu.cn") || base.scheme() != "https" {
+        bail!("电费查询基地址不可信");
     }
-    let prefix = format!("rooms[{}][", building - 1);
-    for line in html.lines() {
-        let Some(rest) = line.trim().strip_prefix(&prefix) else {
-            continue;
-        };
-        let Some((floor, _)) = rest.split_once(']') else {
-            continue;
-        };
-        let Some((_, value)) = line.rsplit_once('=') else {
-            continue;
-        };
-        if value.trim().trim_end_matches(';').parse::<u16>().ok() == Some(room) {
-            return Ok(floor.parse::<u16>()? + 1);
-        }
-    }
-    bail!("页面的宿舍列表中找不到 {building} 公寓 {room} 房间，请核对配置")
+    let mut url = base.join(BALANCE_PATH)?;
+    url.query_pairs_mut()
+        .append_pair("gongyu", &building.to_string())
+        .append_pair("sushe", &room.to_string())
+        .append_pair("floor", &floor.to_string());
+    Ok(url)
 }
 
 fn parse_aircon_reading(html: &str) -> Result<AirconReading> {
     let document = Html::parse_document(html);
-    let row_selector = Selector::parse("form[name='chongdianform'] tr").unwrap();
+    let row_selector = Selector::parse("tr").unwrap();
     let cell_selector = Selector::parse("td").unwrap();
     let mut fields = HashMap::new();
     for row in document.select(&row_selector) {
@@ -425,10 +523,12 @@ mod tests {
     }
 
     #[test]
-    fn finds_floor_from_room_table() {
-        let page = "rooms[2][3][0]=401;\nrooms[2][3][1]=402;";
-        assert_eq!(find_room_floor(page, 3, 402).unwrap(), 4);
-        assert!(find_room_floor(page, 3, 403).is_err());
+    fn builds_direct_balance_request() {
+        let base = Url::parse(SERVICE).unwrap();
+        assert_eq!(
+            balance_url(&base, 8, 2, 207).unwrap().as_str(),
+            "https://gyktgd.wh.sdu.edu.cn/dianbiao/chongzhi.jsp?gongyu=8&sushe=207&floor=2"
+        );
     }
 
     #[test]
@@ -451,7 +551,25 @@ mod tests {
             1,
         );
         let config: Config = serde_yaml::from_str(&yaml).unwrap();
-        assert_eq!(config.selected_aircon().unwrap(), Some((3, 405)));
+        assert_eq!(config.selected_aircon().unwrap(), Some((3, 4, 405)));
+
+        let yaml = yaml.replace("room: 405", "floor: 5\n  room: 405");
+        let config: Config = serde_yaml::from_str(&yaml).unwrap();
+        assert_eq!(config.selected_aircon().unwrap(), Some((3, 5, 405)));
+    }
+
+    #[test]
+    fn adds_or_replaces_device_id_without_touching_credentials() {
+        let id = "0123456789abcdef0123456789abcdef";
+        let config = "cas:\n  username: test\n  password: secret\n";
+        let updated = insert_device_id(config, id).unwrap();
+        assert!(updated.contains("  password: secret\n"));
+        assert_eq!(updated.matches("device_id:").count(), 1);
+
+        let config = "cas:\n  device_id: null\n  password: secret\n";
+        let updated = insert_device_id(config, id).unwrap();
+        assert_eq!(updated.matches("device_id:").count(), 1);
+        assert!(updated.contains(id));
     }
 
     #[test]
