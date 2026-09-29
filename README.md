@@ -1,8 +1,8 @@
 # SDU-InfoHelper
 
 山大威海电量查询与本地监控，运行时只需要 Rust 编译出的一个程序。
-合并 [WinstonMeursault 的母仓库](https://github.com/WinstonMeursault/SDU-InfoHelper) 的
-统一身份认证、设备授信和空调查询，增加宿舍普通用电目录、余额查询、OAuth 缓存与刷新。
+提供统一身份认证、设备授信、宿舍普通用电目录与余额查询、OAuth 缓存与刷新，
+以及独立的空调电量查询。
 
 | 服务 | 查询方式 | 认证 |
 | --- | --- | --- |
@@ -11,7 +11,7 @@
 
 2026-09-29 已实测宿舍目录、跨房间查询、CAS 首次授信、后续免短信登录，
 并取得真实 refresh_token。主动刷新后再次读取宿舍电量成功。
-空调查询沿用母仓库的实现和实测协议，本分支尚未用本机空调目标做真实查询。
+空调查询基于既有实现和已记录协议，本次重构尚未用本机空调目标做真实查询。
 
 ## 安装和配置
 
@@ -27,7 +27,8 @@ bash scripts/electricity.sh check-config
 bash scripts/electricity.sh auth probe
 ```
 
-配置兼容母仓库的 `cas`、`aircon` 和 `dorm_electricity` 段。
+配置保留 `cas`、`aircon` 和 `dorm_electricity` 段，旧 CLI 命令和输出变化见
+[迁移说明](docs/migration.md)。
 `config.yaml`、`.local`、旧抓包与 APK 均被 Git 忽略。
 账号密码只在本机配置；不要放到命令参数、日志或聊天里。
 
@@ -129,7 +130,6 @@ cargo test --locked
 cargo clippy --locked --all-targets -- -D warnings
 ```
 
-Python 原型、抓包导入代码和 Android 安装脚本已移除。
-已有 `.conda`、`.tools`、APK 和抓包可保留作本地调查资料，正常查询不会使用它们。
+本地分析工具、APK 和抓包属于调查资料，正常查询不会使用它们。
 协议及验证边界见 [宿舍接口](docs/protocol.md)、[认证和刷新](docs/auth.md)
-及 [母仓库空调接口](docs/aircon-protocol.md)。项目沿用 GPL-3.0。
+及 [空调接口](docs/aircon-protocol.md)。项目沿用 GPL-3.0。
