@@ -1,10 +1,12 @@
 [package]
 name = "sdu-infohelper"
-version = "0.1.0"
+version = "1.0.0"
 edition = "2024"
 rust-version = "1.88"
 license = "GPL-3.0-only"
 description = "SDU Weihai electricity queries with CAS authentication and local monitoring"
+repository = "https://github.com/WinstonMeursault/SDU-InfoHelper"
+readme = "README.md"
 
 [dependencies]
 base64 = "0.22"
