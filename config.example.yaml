@@ -1,15 +1,18 @@
 cas:
   username: "你的学号"
   password: "你的统一身份认证密码"
+  device_id: null # 首次登录时自动生成，信任设备后请勿删除
 
 # 空调电费；公寓号和房间号需同时填写。
 aircon:
   building: null
+  floor: null # 不填写时从房间号推断，例如 405 -> 4 层
   room: null
 
 # 预留给后续的宿舍电费查询，当前版本尚未接入。
 dorm_electricity:
   building: null
+  floor: null
   room: null
 
 # 可选：登录后保存页面 HTML，便于确认电费字段；路径相对于项目目录。
