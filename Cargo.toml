@@ -1,16 +1,26 @@
 [package]
 name = "sdu-infohelper"
 version = "0.1.0"
-edition = "2021"
+edition = "2024"
+rust-version = "1.88"
+license = "GPL-3.0-only"
+description = "SDU Weihai electricity queries with CAS authentication and local monitoring"
 
 [dependencies]
-anyhow = "1"
+base64 = "0.22"
+fs2 = "0.4"
 hex = "0.4"
 md-5 = "0.10"
 rand = "0.8"
-reqwest = { version = "0.12", default-features = false, features = ["blocking", "cookies", "json", "native-tls"] }
-scraper = "0.23"
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+clap = { version = "4", features = ["derive"] }
+regex = "1"
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "cookies", "json", "rustls-tls", "native-tls"] }
+rusqlite = { version = "0.40", features = ["bundled"] }
+rust_decimal = { version = "1", default-features = false, features = ["std"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde_yaml = "0.9"
-url = "2"
+scraper = "0.23"
+tempfile = "3"
+thiserror = "2"

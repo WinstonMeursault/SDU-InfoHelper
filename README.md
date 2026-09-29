@@ -1,22 +1,135 @@
 # SDU-InfoHelper
 
-山东大学威海校区空调余电查询的 Rust 客户端。通过统一身份认证和手机二次验证后，按配置的公寓、房间读取剩余电量；宿舍电费查询字段已预留，尚未实现。
+山大威海电量查询与本地监控，运行时只需要 Rust 编译出的一个程序。
+提供统一身份认证、设备授信、宿舍普通用电目录与余额查询、OAuth 缓存与刷新，
+以及独立的空调电量查询。
 
-## 使用
+| 服务 | 查询方式 | 认证 |
+| --- | --- | --- |
+| 宿舍普通用电 | 校区 → 楼栋 → 楼层 → 房间；JSON 余额接口 | 缓存 Token → refresh_token → CAS 重新登录 |
+| 空调用电 | 配置公寓、楼层、房间；HTML 余额页面 | CAS 登录和会话 Cookie |
 
-1. `cp config.example.yaml config.yaml`，在本地填入学号和统一身份认证密码。查询空调电费时同时填写 `aircon.building`（公寓号）和 `aircon.room`（房间号）；特殊房间可另填 `aircon.floor`。`dorm_electricity` 是后续宿舍电费查询的预留字段。`config.yaml` 已被 Git 忽略。
-2. 运行 `cargo run -- --probe` 可在不读取凭据的情况下验证学校登录页与表单。随后运行 `cargo run`。如提示需要手机验证，在本机运行 `cargo run -- --sms`，程序会发送验证码并在终端读取，再继续登录。若你决定授信当前设备，可改用 `cargo run -- --trust-device`；学校可能自动解除最早一台受信设备。
-   `cargo run -- --check-config` 只检查本地配置格式，不访问学校网站。
-3. 程序会输出指定房间的剩余电量，并核对页面上的公寓、楼层、房间。若启用了 `output_html`，查余电页面会保存在指定路径。请勿公开该文件，它可能含有个人信息。
+2026-09-29 已实测宿舍目录、跨房间查询、CAS 首次授信、后续免短信登录，
+并取得真实 refresh_token。主动刷新后再次读取宿舍电量成功。
+空调查询基于既有实现和已记录协议，本次重构尚未用本机空调目标做真实查询。
 
-设备授信后可运行 `cargo run -- --json`，只输出一行机器可读的 JSON，例如 `{"service":"aircon","building":1,"floor":2,"room":201,"remaining_kwh":7.01}`。若登录再次要求二次验证，命令会报错，不会输出旧余额。
+## 安装和配置
 
-程序不会把密码写进日志。若学校要求短信、二维码或其他二次认证，当前命令会停止并提示；请不要把短信码或密码发到聊天中。
+使用已有 Rust 1.88+、C 编译器、OpenSSL 开发库及 pkg-config 构建。脚本把 Cargo 缓存放在 `.cache/cargo`、
+编译结果放在 `target`，无需安装 Python、Miniforge、ADB 或代理到系统。
 
-学校前端在正式提交前还会请求 `device` 接口检查设备并可能要求手机验证。命令行程序首次登录会在本地 `config.yaml` 生成独立的 `cas.device_id`；授信后请保留它。只有显式传入 `--sms` 或 `--trust-device` 才会发送短信，验证码不会保存。
+```bash
+bash scripts/build.sh
+umask 077
+cp -n config.example.yaml config.yaml
+# 用本机编辑器填写 cas.username / cas.password，以及需要的查询目标
+bash scripts/electricity.sh check-config
+bash scripts/electricity.sh auth probe
+```
 
-余电通过只读 `GET /dianbiao/chongzhi.jsp` 查询，程序不调用生成订单接口。详细请求及未验证之处见 [空调余电协议记录](docs/aircon-protocol.md)。
+配置保留 `cas`、`aircon` 和 `dorm_electricity` 段，旧 CLI 命令和输出变化见
+[迁移说明](docs/migration.md)。
+`config.yaml`、`.local`、旧抓包与 APK 均被 Git 忽略。
+账号密码只在本机配置；不要放到命令参数、日志或聊天里。
 
-原始链接中的 `jsessionid` 是一次性会话标识，本项目使用不含它的稳定入口：`https://gyktgd.wh.sdu.edu.cn/dianbiao/AuthServlet.se`。
+首次登录宿舍平台：
 
-当前机器的默认 macOS 27.0 SDK 与链接器不兼容，编译时需临时指定已有的 26.5 SDK：`SDKROOT=/Library/Developer/CommandLineTools/SDKs/MacOSX26.5.sdk cargo run`。
+```bash
+bash scripts/electricity.sh auth login --trust-device
+bash scripts/electricity.sh auth status
+# 可选：立即续期，用于确认刷新仍可用
+bash scripts/electricity.sh auth renew
+```
+
+若学校要求验证码，程序在本机终端读取。`--trust-device` 请求授信这台电脑；
+仅验证当次可用 `--sms`。学校可能在受信设备达到上限时解除最早一台设备。
+后续保留自动生成的 `cas.device_id`，供统一认证再次登录时使用。
+后台查询不会自动发送短信。
+
+已有凭据可迁移，无需重新抓包：
+
+```bash
+bash scripts/electricity.sh auth import --input .local/electricity/request.json
+```
+
+`auth import` 也接受本地保存的 OAuth 响应 JSON，包含 `access_token`、
+可选 `refresh_token` 和 `expires_in`；会保存完整刷新凭据，而非只保留访问 Token。
+OAuth 客户端默认 `berserker`，缴费网页的另一种客户端可显式选 `--provider blade`。
+必要时 `--client-auth-file` 指向保存 Basic 认证头的本地文件，不要把值写在命令行。
+旧 `query --config .local/electricity/request.json` 仍可查询，但不启用自动续期。
+
+## 宿舍目录和余额
+
+```bash
+bash scripts/electricity.sh list campuses
+bash scripts/electricity.sh list buildings
+bash scripts/electricity.sh list floors --campus '目录中的校区value' --building '目录中的楼栋value'
+bash scripts/electricity.sh list rooms --campus '目录中的校区value' --building '目录中的楼栋value' --floor '目录中的楼层value'
+bash scripts/electricity.sh query --json
+```
+
+把目录返回的完整 `value` 填入 `dorm_electricity`，包括 `&` 后的显示名。
+也可填唯一匹配的目录名称；数字房间号只在服务器实际返回的目录能匹配时解析，
+程序不会自行猜测房间 ID。只列目录时可以不配置完整宿舍目标。
+
+单次查询另一宿舍可用 `query --campus ... --building ... --floor ... --room ...`，
+不会改写默认监控目标。更换上级目录时需同时指定下级参数。
+每次接口返回一间房间的电量，尚未发现所有宿舍电量的批量接口。
+查询权限和范围仍以学校服务端为准。
+
+程序核对响应中的校区、楼栋、楼层和房间，使用十进制电量。
+供电状态与剩余电量分别记录；失败不会记录为零或返回旧余额。
+
+## 监控和空调
+
+```bash
+bash scripts/monitor.sh start --interval 21600 --threshold 10
+bash scripts/monitor.sh status
+bash scripts/monitor.sh stop
+bash scripts/electricity.sh history --limit 20
+bash scripts/electricity.sh aircon --json
+```
+
+监控使用当前 Linux 用户的 systemd，默认每 6 小时查询一次、10 度及以下提醒。
+历史、错误与提醒记录保存在 `.local/electricity/history.sqlite3`，
+日志在 `.local/electricity/monitor.log`。可加 `--notify-desktop` 调用已有的 `notify-send`。
+服务不默认配置开机启动。没有用户 systemd 时可运行 `electricity.sh watch` 前台监控。
+空调查询需填写 `aircon.building` 和 `aircon.room`，楼层可显式指定。
+
+## 可调用的 Rust API
+
+CLI 的 `query --json` 和 `list ... --json` 可供脚本调用。
+Rust 库的宿舍认证与查询入口：
+
+```rust,no_run
+use std::{path::Path, time::Duration};
+use sdu_infohelper::{with_dorm_auth, query, QueryError};
+
+fn main() -> Result<(), QueryError> {
+    let reading = with_dorm_auth(
+        Path::new("config.yaml"), Duration::from_secs(20),
+        |request, client| query(request, client),
+    )?;
+    println!("{}", reading.remaining_kwh);
+    Ok(())
+}
+```
+
+`selection_options` 查询各级目录，`aircon::query_config` 查询空调，
+`auth` 模块负责登录、缓存、状态和导入。认证操作使用跨进程锁，缓存原子写入且权限 600。
+到期前 5 分钟尝试刷新；接口返回认证失效时续期后最多重试一次只读查询。
+刷新响应提供新 refresh_token 时立即保存；无可用刷新凭据时尝试正常 CAS 登录。
+学校撤销授权、刷新令牌到期或再次要求二次验证时仍需人工处理，不能保证永久免验证。
+
+## 开发验证
+
+```bash
+source scripts/local-env.sh
+cargo fmt --check
+cargo test --locked
+cargo clippy --locked --all-targets -- -D warnings
+```
+
+本地分析工具、APK 和抓包属于调查资料，正常查询不会使用它们。
+协议及验证边界见 [宿舍接口](docs/protocol.md)、[认证和刷新](docs/auth.md)
+及 [空调接口](docs/aircon-protocol.md)。项目沿用 GPL-3.0。

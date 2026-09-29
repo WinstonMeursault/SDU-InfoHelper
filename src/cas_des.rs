@@ -5,7 +5,7 @@ mod tables {
 use tables::{FP, P, PC2, SBOX};
 
 pub fn encrypt(plain: &str) -> String {
-    let keys: [[u8; 64]; 3] = [b'1', b'2', b'3'].map(|digit| {
+    let keys: [[u8; 64]; 3] = (*b"123").map(|digit| {
         let mut bytes = [0_u8; 8];
         bytes[1] = digit;
         bytes_to_bits(bytes)
