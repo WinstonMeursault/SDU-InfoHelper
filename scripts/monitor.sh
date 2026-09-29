@@ -4,7 +4,7 @@ umask 077
 source "$(dirname -- "$0")/local-env.sh"
 state_dir="$PROJECT_ROOT/.local/electricity"
 mkdir -p "$state_dir"
-binary="$PROJECT_ROOT/target/release/sdu-electricity"
+binary="$PROJECT_ROOT/target/release/sdu-infohelper"
 log_file="$state_dir/monitor.log"
 unit="sdu-infohelper-electricity.service"
 exec 9>"$state_dir/monitor.lock"
@@ -38,7 +38,7 @@ case "$action" in
             --working-directory="$PROJECT_ROOT" \
             --property="StandardOutput=append:$log_file" \
             --property=StandardError=inherit --property=UMask=0077 \
-            "$binary" watch --config "$state_dir/request.json" \
+            "$binary" watch --config "$PROJECT_ROOT/config.yaml" \
             --history "$state_dir/history.sqlite3" "$@"
         sleep 1
         if ! monitor_running; then

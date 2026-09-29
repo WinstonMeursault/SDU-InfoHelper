@@ -1,0 +1,21 @@
+cas:
+  username: "" # 在本机填写；有现成 Token 缓存时可暂留空
+  password: ""
+  device_id: null # 首次登录时自动生成，信任设备后请勿删除
+
+auth:
+  cache: .local/electricity/auth.json # 相对于 config.yaml，自动以 600 权限保存
+
+# 空调用电，使用母仓库的独立查询服务。
+aircon:
+  building: null
+  floor: null # 不填写时从房间号推断，例如 405 -> 4 层
+  room: null
+
+# 宿舍普通用电。优先填写 list 返回的完整 value，例如 "服务器ID&显示名"。
+# 也支持目录中唯一匹配的显示名/数字；三位房间号可从实际目录解析。
+dorm_electricity:
+  campus: "主校区"
+  building: null
+  floor: null
+  room: null

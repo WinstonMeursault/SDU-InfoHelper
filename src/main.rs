@@ -10,9 +10,10 @@ use std::{
 use chrono::Utc;
 use clap::{Args, Parser, Subcommand};
 use rust_decimal::Decimal;
-use sdu_electricity::{
-    Config, Event, Location, QueryError, SelectionLevel, alert_due, clear_alert, client, history,
-    mark_alert, query, save_event, selection_options,
+use sdu_infohelper::{
+    Event, Location, QueryError, SelectionLevel, aircon, alert_due, auth, clear_alert, history,
+    mark_alert, query, save_event, selection_options, settings, with_dorm_auth,
+    with_dorm_directory_auth,
 };
 
 #[derive(Parser)]
@@ -24,6 +25,29 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    /// 统一身份认证、令牌导入和登录状态
+    Auth {
+        #[command(subcommand)]
+        command: AuthCommand,
+    },
+    /// 查询母仓库的空调电量（独立于宿舍普通用电）
+    Aircon {
+        #[arg(long, default_value_os_t = default_config())]
+        config: PathBuf,
+        #[arg(long, default_value_t = 20, value_parser = clap::value_parser!(u64).range(1..=300))]
+        timeout: u64,
+        #[arg(long)]
+        sms: bool,
+        #[arg(long)]
+        trust_device: bool,
+        #[arg(long)]
+        json: bool,
+    },
+    /// 检查统一 YAML 配置结构，不访问网络
+    CheckConfig {
+        #[arg(long, default_value_os_t = default_config())]
+        config: PathBuf,
+    },
     /// 独立查询一次
     Query(QueryArgs),
     /// 定时查询、保存历史并提醒
@@ -36,6 +60,52 @@ enum Command {
         history: PathBuf,
         #[arg(long, default_value_t = 20, value_parser = clap::value_parser!(u32).range(1..=1000))]
         limit: u32,
+    },
+}
+
+#[derive(Subcommand)]
+enum AuthCommand {
+    /// 立即续期缓存的令牌，用于验证刷新或 CAS 回退
+    Renew {
+        #[arg(long, default_value_os_t = default_config())]
+        config: PathBuf,
+        #[arg(long, default_value_t = 20, value_parser = clap::value_parser!(u64).range(1..=300))]
+        timeout: u64,
+    },
+    /// 登录宿舍平台；短信只在显式指定时发送
+    Login {
+        #[arg(long, default_value_os_t = default_config())]
+        config: PathBuf,
+        #[arg(long, default_value_t = 20, value_parser = clap::value_parser!(u64).range(1..=300))]
+        timeout: u64,
+        #[arg(long)]
+        sms: bool,
+        #[arg(long)]
+        trust_device: bool,
+    },
+    /// 只检查本地令牌缓存，不输出令牌
+    Status {
+        #[arg(long, default_value_os_t = default_config())]
+        config: PathBuf,
+    },
+    /// 匿名检查 CAS 登录页与表单，无需账号
+    Probe {
+        #[arg(long)]
+        aircon: bool,
+        #[arg(long, default_value_t = 20, value_parser = clap::value_parser!(u64).range(1..=300))]
+        timeout: u64,
+    },
+    /// 从本地 OAuth 登录响应 JSON 或旧 request.json 导入凭据
+    Import {
+        #[arg(long, default_value_os_t = default_config())]
+        config: PathBuf,
+        #[arg(long)]
+        input: PathBuf,
+        #[arg(long, value_enum, default_value_t = auth::OAuthProvider::Berserker)]
+        provider: auth::OAuthProvider,
+        /// 本地文件保存的一行 Basic 认证头；不在命令行填写秘密
+        #[arg(long)]
+        client_auth_file: Option<PathBuf>,
     },
 }
 
@@ -117,7 +187,7 @@ struct WatchArgs {
 }
 
 fn default_config() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(".local/electricity/request.json")
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("config.yaml")
 }
 fn default_history() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(".local/electricity/history.sqlite3")
@@ -142,19 +212,30 @@ fn secure_history(path: &std::path::Path) -> Result<(), String> {
 
 fn event(args: &QueryArgs) -> (Event, bool, bool) {
     let mut target = None;
-    let result = Config::load(&args.config).and_then(|config| {
-        let config = config.with_location_overrides(&args.location.overrides())?;
-        let location = config.location()?;
-        target = Some(location.clone());
-        let connection = client(Duration::from_secs(args.timeout))?;
-        let reading = query(&config, &connection)?;
-        Ok(Event::success(reading, args.threshold, config.expiry_claim()).at_location(location))
-    });
+    let result = with_dorm_auth(
+        &args.config,
+        Duration::from_secs(args.timeout),
+        |config, connection| {
+            let config = config.with_location_overrides(&args.location.overrides())?;
+            if config.form.values().any(|value| value == "_") {
+                return Err(QueryError::Config(
+                    "请配置完整 dorm_electricity 目标，或使用 --campus --building --floor --room 指定。",
+                ));
+            }
+            let location = config.location()?;
+            target = Some(location.clone());
+            let reading = query(&config, connection)?;
+            Ok(
+                Event::success(reading, args.threshold, config.expiry_claim())
+                    .at_location(location),
+            )
+        },
+    );
     match result {
         Ok(event) => (event, false, false),
         Err(error) => {
             let auth = matches!(error, QueryError::Authentication);
-            let fatal = auth || matches!(error, QueryError::Config(_));
+            let fatal = auth || matches!(error, QueryError::Config(_) | QueryError::AuthFlow(_));
             let mut failure = Event::failure(&error);
             failure.location = target;
             (failure, fatal, auth)
@@ -209,8 +290,73 @@ fn alert(title: &str, message: &str, desktop: bool) -> bool {
 
 fn run(cli: Cli) -> Result<bool, String> {
     match cli.command {
+        Command::CheckConfig { config } => {
+            settings::Settings::load(&config).map_err(|e| e.to_string())?;
+            println!("YAML 配置结构有效；账号、设备授信和服务可用性需登录验证。");
+            Ok(true)
+        }
+        Command::Auth { command } => {
+            let status = match command {
+                AuthCommand::Renew { config, timeout } => {
+                    auth::renew(&config, Duration::from_secs(timeout))
+                }
+                AuthCommand::Login {
+                    config,
+                    timeout,
+                    sms,
+                    trust_device,
+                } => auth::login(
+                    &config,
+                    Duration::from_secs(timeout),
+                    auth::LoginOptions { sms, trust_device },
+                ),
+                AuthCommand::Status { config } => auth::status(&config),
+                AuthCommand::Import {
+                    config,
+                    input,
+                    provider,
+                    client_auth_file,
+                } => auth::import(&config, &input, provider, client_auth_file.as_deref()),
+                AuthCommand::Probe { aircon, timeout } => {
+                    auth::probe(aircon, Duration::from_secs(timeout)).map_err(|e| e.to_string())?;
+                    println!("学校 CAS 登录页可达，动态表单有效。账号登录尚未验证。");
+                    return Ok(true);
+                }
+            }
+            .map_err(|e| e.to_string())?;
+            println!(
+                "{}",
+                serde_json::to_string(&status).map_err(|_| "认证状态序列化失败。")?
+            );
+            Ok(true)
+        }
+        Command::Aircon {
+            config,
+            timeout,
+            sms,
+            trust_device,
+            json,
+        } => {
+            let reading = aircon::query_config(
+                &config,
+                Duration::from_secs(timeout),
+                auth::LoginOptions { sms, trust_device },
+            )
+            .map_err(|e| e.to_string())?;
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string(&reading).map_err(|_| "空调读数序列化失败。")?
+                );
+            } else {
+                println!(
+                    "{} 公寓 / {} 层 / {} 房间：空调剩余 {} 度",
+                    reading.building, reading.floor, reading.room, reading.remaining_kwh
+                );
+            }
+            Ok(true)
+        }
         Command::List(args) => {
-            let config = Config::load(&args.config).map_err(|error| error.to_string())?;
             let overrides = [
                 ("campus", args.campus),
                 ("building", args.building),
@@ -219,10 +365,13 @@ fn run(cli: Cli) -> Result<bool, String> {
             .into_iter()
             .filter_map(|(key, value)| value.map(|value| (key.to_owned(), value)))
             .collect();
-            let connection =
-                client(Duration::from_secs(args.timeout)).map_err(|error| error.to_string())?;
-            let options = selection_options(&config, &connection, args.level, &overrides)
-                .map_err(|error| error.to_string())?;
+            let options = with_dorm_directory_auth(
+                &args.config,
+                Duration::from_secs(args.timeout),
+                args.level,
+                |config, connection| selection_options(config, connection, args.level, &overrides),
+            )
+            .map_err(|error| error.to_string())?;
             if args.json {
                 println!(
                     "{}",
@@ -349,7 +498,7 @@ fn run(cli: Cli) -> Result<bool, String> {
                 if auth {
                     alert(
                         "电费监控登录已失效",
-                        "请通过 App 抓包更新凭据，然后重新启动监控。",
+                        "请在本机运行 auth login --trust-device 完成登录，然后重新启动监控。",
                         args.notify_desktop,
                     );
                 }

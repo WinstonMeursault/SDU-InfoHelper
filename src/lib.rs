@@ -9,14 +9,65 @@ use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+pub mod aircon;
+pub mod auth;
+mod cas;
+mod cas_des;
+pub mod settings;
+
 pub const ENDPOINT: &str = "https://mcard.sdu.edu.cn/charge/feeitem/getThirdData";
+
+/// Authenticated, read-only dorm operation. Renew on HTTP/business 401 once.
+/// Legacy request.json remains readable, while new deployments use config.yaml.
+pub fn with_dorm_auth<T>(
+    path: &Path,
+    timeout: Duration,
+    mut operation: impl FnMut(&Config, &Client) -> Result<T, QueryError>,
+) -> Result<T, QueryError> {
+    with_dorm_auth_depth(path, timeout, 4, &mut operation)
+}
+
+/// Directory lookups resolve only the ancestors required by this level.
+pub fn with_dorm_directory_auth<T>(
+    path: &Path,
+    timeout: Duration,
+    level: SelectionLevel,
+    mut operation: impl FnMut(&Config, &Client) -> Result<T, QueryError>,
+) -> Result<T, QueryError> {
+    with_dorm_auth_depth(path, timeout, level.number(), &mut operation)
+}
+
+fn with_dorm_auth_depth<T>(
+    path: &Path,
+    timeout: Duration,
+    depth: usize,
+    operation: &mut impl FnMut(&Config, &Client) -> Result<T, QueryError>,
+) -> Result<T, QueryError> {
+    let client = client(timeout)?;
+    if path.extension().is_some_and(|x| x == "json") {
+        return operation(&Config::load(path)?, &client);
+    }
+    let settings = settings::Settings::load(path)?;
+    let token = auth::token(&settings, path, timeout, None)?;
+    let attempt = settings
+        .dorm_request_depth(&token.access_token, &client, depth)
+        .and_then(|request| operation(&request, &client));
+    if !matches!(attempt, Err(QueryError::Authentication)) {
+        return attempt;
+    }
+    let token = auth::token(&settings, path, timeout, Some(&token.access_token))?;
+    let request = settings.dorm_request_depth(&token.access_token, &client, depth)?;
+    operation(&request, &client)
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum QueryError {
     #[error("{0}")]
     Config(&'static str),
-    #[error("登录凭据已失效，请在 App 查询后重新导入抓包。")]
+    #[error("登录凭据已失效，请在本机运行 auth login；首次登录可加 --trust-device。")]
     Authentication,
+    #[error("{0}")]
+    AuthFlow(&'static str),
     #[error("连接学校接口超时，未获得有效电量。")]
     Timeout,
     #[error("连接学校接口失败，未获得有效电量。")]
@@ -27,7 +78,7 @@ pub enum QueryError {
     Response(&'static str),
 }
 
-#[derive(Clone, Deserialize)]
+#[derive(Clone, Deserialize, Serialize)]
 pub struct Config {
     pub schema_version: u32,
     pub url: String,
@@ -37,10 +88,10 @@ pub struct Config {
 
 impl Config {
     pub fn load(path: &Path) -> Result<Self, QueryError> {
-        let text = fs::read_to_string(path)
-            .map_err(|_| QueryError::Config("无法读取查询配置，请先用 Python 工具导入抓包。"))?;
-        let config: Self = serde_json::from_str(&text)
-            .map_err(|_| QueryError::Config("查询配置格式不匹配，请重新导入抓包。"))?;
+        let text =
+            fs::read_to_string(path).map_err(|_| QueryError::Config("无法读取查询配置。"))?;
+        let config: Self =
+            serde_json::from_str(&text).map_err(|_| QueryError::Config("查询配置格式不匹配。"))?;
         config.validate()?;
         Ok(config)
     }
@@ -70,13 +121,13 @@ impl Config {
         }
         if self.auth().is_none_or(str::is_empty) {
             return Err(QueryError::Config(
-                "缺少 synjones-auth，请重新导入 App 抓包。",
+                "缺少 synjones-auth，请运行 auth login 或 auth import。",
             ));
         }
         Ok(())
     }
 
-    fn auth(&self) -> Option<&str> {
+    pub fn auth(&self) -> Option<&str> {
         self.headers
             .iter()
             .find(|(k, _)| k.eq_ignore_ascii_case("synjones-auth"))
@@ -272,6 +323,7 @@ pub fn parse_response(payload: &Value) -> Result<Reading, QueryError> {
 
 pub fn client(timeout: Duration) -> Result<Client, QueryError> {
     Client::builder()
+        .use_rustls_tls()
         .timeout(timeout)
         .connect_timeout(timeout)
         .redirect(Policy::none())
