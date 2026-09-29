@@ -1,4 +1,5 @@
 use std::{
+    collections::BTreeMap,
     fs,
     path::PathBuf,
     process::{Command as ProcessCommand, ExitCode},
@@ -10,8 +11,8 @@ use chrono::Utc;
 use clap::{Args, Parser, Subcommand};
 use rust_decimal::Decimal;
 use sdu_electricity::{
-    Config, Event, QueryError, alert_due, clear_alert, client, history, mark_alert, query,
-    save_event,
+    Config, Event, Location, QueryError, SelectionLevel, alert_due, clear_alert, client, history,
+    mark_alert, query, save_event, selection_options,
 };
 
 #[derive(Parser)]
@@ -27,6 +28,8 @@ enum Command {
     Query(QueryArgs),
     /// 定时查询、保存历史并提醒
     Watch(WatchArgs),
+    /// 列出校区、楼栋、楼层或房间，使用返回的参数值查询
+    List(ListArgs),
     /// 查看近期查询记录
     History {
         #[arg(long, default_value_os_t = default_history())]
@@ -48,6 +51,56 @@ struct QueryArgs {
     threshold: Option<Decimal>,
     #[arg(long)]
     json: bool,
+    #[command(flatten)]
+    location: LocationArgs,
+}
+
+#[derive(Args, Default)]
+struct LocationArgs {
+    /// 校区参数值
+    #[arg(long, value_parser = clap::builder::NonEmptyStringValueParser::new())]
+    campus: Option<String>,
+    /// 楼栋参数值
+    #[arg(long, value_parser = clap::builder::NonEmptyStringValueParser::new())]
+    building: Option<String>,
+    /// 楼层参数值
+    #[arg(long, value_parser = clap::builder::NonEmptyStringValueParser::new())]
+    floor: Option<String>,
+    /// 房间参数值，来自 list rooms
+    #[arg(long, value_parser = clap::builder::NonEmptyStringValueParser::new())]
+    room: Option<String>,
+}
+
+impl LocationArgs {
+    fn overrides(&self) -> BTreeMap<String, String> {
+        [
+            ("campus", &self.campus),
+            ("building", &self.building),
+            ("floor", &self.floor),
+            ("room", &self.room),
+        ]
+        .into_iter()
+        .filter_map(|(key, value)| value.as_ref().map(|value| (key.to_owned(), value.clone())))
+        .collect()
+    }
+}
+
+#[derive(Args)]
+struct ListArgs {
+    #[arg(value_enum)]
+    level: SelectionLevel,
+    #[arg(long, default_value_os_t = default_config())]
+    config: PathBuf,
+    #[arg(long, default_value_t = 20, value_parser = clap::value_parser!(u64).range(1..=300))]
+    timeout: u64,
+    #[arg(long)]
+    json: bool,
+    #[arg(long, value_parser = clap::builder::NonEmptyStringValueParser::new())]
+    campus: Option<String>,
+    #[arg(long, value_parser = clap::builder::NonEmptyStringValueParser::new())]
+    building: Option<String>,
+    #[arg(long, value_parser = clap::builder::NonEmptyStringValueParser::new())]
+    floor: Option<String>,
 }
 
 #[derive(Args)]
@@ -88,21 +141,23 @@ fn secure_history(path: &std::path::Path) -> Result<(), String> {
 }
 
 fn event(args: &QueryArgs) -> (Event, bool, bool) {
+    let mut target = None;
     let result = Config::load(&args.config).and_then(|config| {
+        let config = config.with_location_overrides(&args.location.overrides())?;
+        let location = config.location()?;
+        target = Some(location.clone());
         let connection = client(Duration::from_secs(args.timeout))?;
         let reading = query(&config, &connection)?;
-        Ok(Event::success(
-            reading,
-            args.threshold,
-            config.expiry_claim(),
-        ))
+        Ok(Event::success(reading, args.threshold, config.expiry_claim()).at_location(location))
     });
     match result {
         Ok(event) => (event, false, false),
         Err(error) => {
             let auth = matches!(error, QueryError::Authentication);
             let fatal = auth || matches!(error, QueryError::Config(_));
-            (Event::failure(&error), fatal, auth)
+            let mut failure = Event::failure(&error);
+            failure.location = target;
+            (failure, fatal, auth)
         }
     }
 }
@@ -116,6 +171,9 @@ fn print_event(event: &Event, json: bool) {
     } else if let Some(error) = &event.error {
         eprintln!("[{}] 查询失败：{error}", event.checked_at);
     } else {
+        if let Some(location) = &event.location {
+            println!("宿舍：{}", location.label());
+        }
         println!(
             "[{}] 剩余电量：{} 度",
             event.checked_at,
@@ -151,6 +209,33 @@ fn alert(title: &str, message: &str, desktop: bool) -> bool {
 
 fn run(cli: Cli) -> Result<bool, String> {
     match cli.command {
+        Command::List(args) => {
+            let config = Config::load(&args.config).map_err(|error| error.to_string())?;
+            let overrides = [
+                ("campus", args.campus),
+                ("building", args.building),
+                ("floor", args.floor),
+            ]
+            .into_iter()
+            .filter_map(|(key, value)| value.map(|value| (key.to_owned(), value)))
+            .collect();
+            let connection =
+                client(Duration::from_secs(args.timeout)).map_err(|error| error.to_string())?;
+            let options = selection_options(&config, &connection, args.level, &overrides)
+                .map_err(|error| error.to_string())?;
+            if args.json {
+                println!(
+                    "{}",
+                    serde_json::to_string(&options).map_err(|_| "目录序列化失败。")?
+                );
+            } else {
+                println!("名称\t参数值");
+                for option in options {
+                    println!("{}\t{}", option.name, option.value);
+                }
+            }
+            Ok(true)
+        }
         Command::History {
             history: path,
             limit,
@@ -160,22 +245,41 @@ fn run(cli: Cli) -> Result<bool, String> {
             }
             let connection = history(&path).map_err(|_| "无法读取历史文件。")?;
             let mut statement = connection.prepare(
-                "SELECT checked_at, remaining_kwh, supply_status, error FROM readings ORDER BY id DESC LIMIT ?1"
+                "SELECT checked_at, remaining_kwh, supply_status, error, campus, building, floor, room FROM readings ORDER BY id DESC LIMIT ?1"
             ).map_err(|_| "无法读取历史记录。")?;
             let rows = statement
                 .query_map([limit], |row| {
+                    let location = match (
+                        row.get::<_, Option<String>>(4)?,
+                        row.get::<_, Option<String>>(5)?,
+                        row.get::<_, Option<String>>(6)?,
+                        row.get::<_, Option<String>>(7)?,
+                    ) {
+                        (Some(campus), Some(building), Some(floor), Some(room)) => Some(Location {
+                            campus,
+                            building,
+                            floor,
+                            room,
+                        }),
+                        _ => None,
+                    };
                     Ok((
                         row.get::<_, String>(0)?,
                         row.get::<_, Option<String>>(1)?,
                         row.get::<_, Option<String>>(2)?,
                         row.get::<_, Option<String>>(3)?,
+                        location,
                     ))
                 })
                 .map_err(|_| "无法读取历史记录。")?;
             for row in rows {
-                let (at, energy, supply, error) = row.map_err(|_| "无法读取历史记录。")?;
+                let (at, energy, supply, error, location) =
+                    row.map_err(|_| "无法读取历史记录。")?;
                 println!(
-                    "{at}\t{}\t{}",
+                    "{at}\t{}\t{}\t{}",
+                    location
+                        .map(|location| location.label())
+                        .unwrap_or_else(|| "宿舍未记录".into()),
                     energy
                         .map(|value| format!("{value} 度"))
                         .unwrap_or_else(|| "查询失败".into()),
@@ -214,8 +318,18 @@ fn run(cli: Cli) -> Result<bool, String> {
                 save_event(&connection, &event).map_err(|_| "无法写入查询记录。")?;
                 print_event(&event, args.query.json);
                 let now = Utc::now().timestamp();
+                let topic = format!(
+                    "low:{}:{}",
+                    event
+                        .location
+                        .as_ref()
+                        .map(|location| serde_json::to_string(location)
+                            .expect("location serialization"))
+                        .unwrap_or_default(),
+                    event.threshold_kwh.as_deref().unwrap_or("")
+                );
                 if event.low_balance == Some(true) {
-                    if alert_due(&connection, "low", now, args.repeat_after)
+                    if alert_due(&connection, &topic, now, args.repeat_after)
                         .map_err(|_| "无法读取提醒记录。")?
                         && alert(
                             "宿舍电量不足",
@@ -227,10 +341,10 @@ fn run(cli: Cli) -> Result<bool, String> {
                             args.notify_desktop,
                         )
                     {
-                        mark_alert(&connection, "low", now).map_err(|_| "无法保存提醒记录。")?;
+                        mark_alert(&connection, &topic, now).map_err(|_| "无法保存提醒记录。")?;
                     }
                 } else if event.low_balance == Some(false) {
-                    clear_alert(&connection, "low").map_err(|_| "无法更新提醒记录。")?;
+                    clear_alert(&connection, &topic).map_err(|_| "无法更新提醒记录。")?;
                 }
                 if auth {
                     alert(

@@ -37,9 +37,46 @@ bash scripts/electricity.sh history --limit 10
 ```
 
 查询直接连接学校 HTTPS 接口，不依赖手机、USB、mitmweb 或环境中的 HTTP 代理。
-每次查询把时间、电量、供电状态及错误保存到 `.local/electricity/history.sqlite3`。
+每次查询把时间、宿舍、电量、供电状态及错误保存到 `.local/electricity/history.sqlite3`。
 查询失败保留空电量，不会写成零。接口有时同时返回有效电量与供电状态“查询失败”，
 两项分别保留。
+
+## 选择其他宿舍
+
+接口支持校区、楼栋、楼层、房间目录，并可用同一登录凭据指定房间查询。
+以下命令默认使用本地配置的上级目录：
+
+```bash
+bash scripts/electricity.sh list campuses
+bash scripts/electricity.sh list buildings
+bash scripts/electricity.sh list floors
+bash scripts/electricity.sh list rooms
+```
+
+目录返回“名称”和“参数值”；将返回的参数值完整复制到查询参数，包括其中的 `&`。
+同一楼层选择另一个房间：
+
+```bash
+bash scripts/electricity.sh query --room '房间参数值' --json
+```
+
+跨楼栋时先列楼层，再列房间；查询时提供完整的下级参数：
+
+```bash
+bash scripts/electricity.sh list floors --building '楼栋参数值'
+bash scripts/electricity.sh list rooms --building '楼栋参数值' --floor '楼层参数值'
+bash scripts/electricity.sh query --building '楼栋参数值' --floor '楼层参数值' --room '房间参数值'
+```
+
+跨校区时额外传入 `--campus '校区参数值'`。各级目录命令支持 `--json`。
+覆盖参数只作用于本次命令，不修改本地配置或正在运行的监控目标。
+返回数据会核对四级宿舍信息，历史记录包含宿舍信息。旧版历史没有宿舍字段的记录显示“宿舍未记录”。
+不同宿舍的提醒状态分别保存；也可通过 `watch` 的同名参数监控指定房间。
+
+当前验证的是威海电控项目 `feeitemid=411`；列目录仍需有效登录。
+接口返回剩余电量（度），每次查询一间房。尚未发现一次返回所有宿舍电量的批量接口。
+
+## 后台监控
 
 启动项目内后台监控，默认每 6 小时查询、剩余电量不高于 10 度时提醒：
 
