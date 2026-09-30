@@ -59,11 +59,16 @@ fn wait(paths: &Paths, previous: Option<&str>) -> String {
 }
 
 #[cfg(windows)]
-fn assert_no_console(pid: u32) {
+fn assert_hidden_console(pid: u32) {
     use std::os::windows::process::CommandExt;
-    let script = r#"Add-Type -TypeDefinition 'using System.Runtime.InteropServices; public static class NativeConsole { [DllImport("kernel32.dll", SetLastError=true)] public static extern bool AttachConsole(uint id); [DllImport("kernel32.dll")] public static extern bool FreeConsole(); }';
+    // A hidden console or pseudoconsole may retain a handle; check actual visibility.
+    // https://learn.microsoft.com/windows/console/getconsolewindow
+    let script = r#"Add-Type -TypeDefinition 'using System.Runtime.InteropServices; public static class NativeConsole { [DllImport("kernel32.dll", SetLastError=true)] public static extern bool AttachConsole(uint id); [DllImport("kernel32.dll")] public static extern bool FreeConsole(); [DllImport("kernel32.dll")] public static extern System.IntPtr GetConsoleWindow(); [DllImport("user32.dll")] public static extern bool IsWindowVisible(System.IntPtr window); }';
 [void][NativeConsole]::FreeConsole();
-if ([NativeConsole]::AttachConsole(WORKER_PID)) { [void][NativeConsole]::FreeConsole(); exit 1 };
+if ([NativeConsole]::AttachConsole(WORKER_PID)) {
+    $visible=[NativeConsole]::IsWindowVisible([NativeConsole]::GetConsoleWindow());
+    [void][NativeConsole]::FreeConsole(); if($visible){exit 1}; exit 0
+};
 if ([Runtime.InteropServices.Marshal]::GetLastWin32Error() -ne 6) { exit 2 }; exit 0"#;
     let output = Command::new("powershell.exe")
         .creation_flags(0x08000000)
@@ -73,7 +78,7 @@ if ([Runtime.InteropServices.Marshal]::GetLastWin32Error() -ne 6) { exit 2 }; ex
         .unwrap();
     assert!(
         output.status.success(),
-        "worker must have no console: {output:?}"
+        "worker console must be hidden: {output:?}"
     );
 }
 
@@ -99,7 +104,7 @@ fn native_install_start_restart_autostart_stop_uninstall() {
     ok(&config, &["start"]);
     let first = wait(&paths, None);
     #[cfg(windows)]
-    assert_no_console(paths.state().unwrap().unwrap().pid);
+    assert_hidden_console(paths.state().unwrap().unwrap().pid);
     assert_eq!(status(&config)["service"]["active"], true);
     ok(&config, &["start"]);
     assert_eq!(paths.state().unwrap().unwrap().run_id, first);

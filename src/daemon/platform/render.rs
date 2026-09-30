@@ -163,6 +163,7 @@ mod tests {
                 .map(|b| u16::from_le_bytes([b[0], b[1]]))
                 .collect();
             let xml = String::from_utf16(&units).unwrap();
+            assert!(xml.contains("-WindowStyle Hidden"));
             assert_eq!(xml.contains("<LogonTrigger>"), autostart);
             for expected in [
                 "<ExecutionTimeLimit>PT0S</ExecutionTimeLimit>",
