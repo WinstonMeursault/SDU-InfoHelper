@@ -7,6 +7,9 @@ use std::{
     path::{Path, PathBuf},
 };
 
+pub mod monitoring;
+pub use monitoring::{DaemonSettings, NotificationSettings};
+
 #[derive(Clone, Default, Deserialize, Serialize)]
 pub struct Credentials {
     pub username: String,
@@ -87,6 +90,10 @@ pub struct Settings {
     pub dorm_electricity: DormTarget,
     #[serde(default)]
     pub aircon: AirconTarget,
+    #[serde(default)]
+    pub daemon: DaemonSettings,
+    #[serde(default)]
+    pub notifications: NotificationSettings,
 }
 
 impl Settings {
@@ -154,8 +161,11 @@ impl Settings {
         let text = fs::read_to_string(path).map_err(|_| {
             QueryError::Config("无法读取 config.yaml，请复制 config.example.yaml 后在本机填写。")
         })?;
-        serde_yaml::from_str(&text)
-            .map_err(|_| QueryError::Config("config.yaml 格式不匹配，请检查配置结构。"))
+        let settings: Self = serde_yaml::from_str(&text)
+            .map_err(|_| QueryError::Config("config.yaml 格式不匹配，请检查配置结构。"))?;
+        settings.daemon.validate()?;
+        settings.notifications.validate()?;
+        Ok(settings)
     }
     pub fn cache_path(&self, config_path: &Path) -> PathBuf {
         let base = config_path.parent().unwrap_or(Path::new("."));
