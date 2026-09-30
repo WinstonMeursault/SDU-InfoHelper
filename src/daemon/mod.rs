@@ -183,7 +183,7 @@ impl Paths {
     }
     fn acquire_with_id(&self, run_id: String) -> Result<InstanceLock, String> {
         self.ensure()?;
-        let mut file = private_file(&self.file("run.lock"))?;
+        let file = private_file(&self.file("run.lock"))?;
         FileExt::try_lock_exclusive(&file).map_err(|error| {
             if contended(&error) {
                 "该配置的监控已运行。"
@@ -191,9 +191,9 @@ impl Paths {
                 "无法锁定监控实例。"
             }
         })?;
-        file.set_len(0)
-            .and_then(|_| file.write_all(run_id.as_bytes()))
-            .and_then(|_| file.sync_data())
+        // Windows byte-range locks prevent another handle from reading the locked
+        // file. Publish identity separately while retaining the exclusive lifetime lock.
+        auth::secure_write(&self.file("run.owner"), run_id.as_bytes())
             .map_err(|_| "无法发布监控实例标识。")?;
         Ok(InstanceLock {
             run_id,
@@ -268,7 +268,12 @@ impl Paths {
         Err("监控正在启动，尚未提供当前实例状态，请稍后重试。".into())
     }
     fn owner(&self) -> Result<String, String> {
-        let file = File::open(self.file("run.lock")).map_err(|_| "无法读取实例标识。")?;
+        let file = match File::open(self.file("run.owner")) {
+            Ok(file) => file,
+            // The worker may hold the lock briefly before publishing its identity.
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(String::new()),
+            Err(_) => return Err("无法读取实例标识。".into()),
+        };
         let mut text = String::new();
         file.take(256)
             .read_to_string(&mut text)

@@ -82,7 +82,8 @@ daemon 的 YAML 历史路径相对于配置文件目录。`--history` 或
 ```
 
 每个配置有独立实例目录：`.local/electricity/daemon/<instance-id>/`。
-status 会显示实际目录；其中保存原子更新的 `status.json`、运行锁、停止请求和 `daemon.log`。
+status 会显示实际目录；其中保存原子更新的 `status.json`、运行锁 `run.lock`、
+实例标识 `run.owner`、停止请求和 `daemon.log`。
 日志每文件最多约 5 MiB，保留 3 个归档。不要删除正在使用的锁文件。
 
 状态包含最近完成的查询时间、下次检查、最近成功读数和各渠道发送结果。
