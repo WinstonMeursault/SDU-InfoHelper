@@ -73,7 +73,7 @@ jobs:
         run: |
           package="sdu-infohelper-${GITHUB_REF_NAME}-${{ matrix.triple }}"
           mkdir -p "dist/$package"
-          cp "target/release/${{ matrix.executable }}" README.md LICENSE config.example.yaml "dist/$package/"
+          cp "target/release/${{ matrix.executable }}" README.md CHANGELOG.md LICENSE config.example.yaml "dist/$package/"
           cp -R docs "dist/$package/"
           "dist/$package/${{ matrix.executable }}" --version
           if [[ '${{ matrix.archive }}' == 'zip' ]]; then

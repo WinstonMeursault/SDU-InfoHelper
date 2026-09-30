@@ -11,8 +11,8 @@ use chrono::Utc;
 use clap::{Args, Parser, Subcommand};
 use rust_decimal::Decimal;
 use sdu_infohelper::{
-    Event, Location, QueryError, SelectionLevel, aircon, alert_due, auth, clear_alert, history,
-    mark_alert, query, save_event, selection_options, settings, with_dorm_auth_overrides,
+    Event, Location, SelectionLevel, aircon, alert_due, auth, clear_alert, daemon, history,
+    mark_alert, monitor, save_event, selection_options, settings,
     with_dorm_directory_auth_overrides,
 };
 
@@ -52,6 +52,13 @@ enum Command {
     Query(QueryArgs),
     /// 定时查询、保存历史并提醒
     Watch(WatchArgs),
+    /// 跨平台常驻监控及通知渠道测试
+    Daemon {
+        #[arg(long, global = true, default_value_os_t = default_config())]
+        config: PathBuf,
+        #[command(subcommand)]
+        command: DaemonCommand,
+    },
     /// 列出校区、楼栋、楼层或房间，使用返回的参数值查询
     List(ListArgs),
     /// 查看近期查询记录
@@ -60,6 +67,44 @@ enum Command {
         history: PathBuf,
         #[arg(long, default_value_t = 20, value_parser = clap::value_parser!(u32).range(1..=1000))]
         limit: u32,
+    },
+}
+
+#[derive(Subcommand)]
+enum DaemonCommand {
+    /// 前台运行；系统后台任务也调用此入口
+    Run(daemon::RunOptions),
+    /// 注册当前用户后台任务；自启动需显式开启，不立即启动
+    Install {
+        #[arg(long)]
+        autostart: bool,
+    },
+    /// 启动已安装的后台任务
+    Start,
+    /// 停止后重新启动并读取配置
+    Restart {
+        #[arg(long, default_value_t = 30, value_parser = clap::value_parser!(u64).range(1..=300))]
+        wait_seconds: u64,
+    },
+    /// 停止并移除服务注册，保留配置、历史和日志
+    Uninstall {
+        #[arg(long, default_value_t = 30, value_parser = clap::value_parser!(u64).range(1..=300))]
+        wait_seconds: u64,
+    },
+    /// 请求当前实例优雅停止
+    Stop {
+        #[arg(long, default_value_t = 30, value_parser = clap::value_parser!(u64).range(1..=300))]
+        wait_seconds: u64,
+    },
+    /// 查看进程及最近查询和推送状态
+    Status {
+        #[arg(long)]
+        json: bool,
+    },
+    /// 显式发送测试消息，不影响预警冷却
+    TestNotification {
+        #[arg(long)]
+        channel: Option<String>,
     },
 }
 
@@ -216,43 +261,15 @@ fn secure_history(_path: &std::path::Path) -> Result<(), String> {
     Ok(())
 }
 
-fn failure_flags(error: &QueryError) -> (bool, bool) {
-    let needs_login_attention =
-        matches!(error, QueryError::Authentication | QueryError::AuthFlow(_));
-    let fatal = needs_login_attention || matches!(error, QueryError::Config(_));
-    (fatal, needs_login_attention)
-}
-
 fn event(args: &QueryArgs) -> (Event, bool, bool) {
-    let mut target = None;
-    let result = with_dorm_auth_overrides(
+    let sample = monitor::query_once(
         &args.config,
         Duration::from_secs(args.timeout),
+        args.threshold,
         &args.location.overrides(),
-        |config, connection| {
-            if config.form.values().any(|value| value == "_") {
-                return Err(QueryError::Config(
-                    "请配置完整 dorm_electricity 目标，或使用 --campus --building --floor --room 指定。",
-                ));
-            }
-            let location = config.location()?;
-            target = Some(location.clone());
-            let reading = query(config, connection)?;
-            Ok(
-                Event::success(reading, args.threshold, config.expiry_claim())
-                    .at_location(location),
-            )
-        },
+        monitor::Comparison::Inclusive,
     );
-    match result {
-        Ok(event) => (event, false, false),
-        Err(error) => {
-            let (fatal, auth) = failure_flags(&error);
-            let mut failure = Event::failure(&error);
-            failure.location = target;
-            (failure, fatal, auth)
-        }
-    }
+    (sample.event, sample.fatal, sample.needs_login)
 }
 
 fn print_event(event: &Event, json: bool) {
@@ -302,6 +319,127 @@ fn alert(title: &str, message: &str, desktop: bool) -> bool {
 
 fn run(cli: Cli) -> Result<bool, String> {
     match cli.command {
+        Command::Daemon { config, command } => {
+            match command {
+                DaemonCommand::Install { autostart } => {
+                    let running = daemon::platform::install(&config, autostart)?;
+                    println!(
+                        "后台服务已安装；登录自启动：{}。",
+                        if autostart { "开启" } else { "关闭" }
+                    );
+                    if running {
+                        println!("现有实例仍在运行；新注册参数在 restart 后应用。");
+                    } else {
+                        println!("执行 daemon start 启动监控。");
+                    }
+                    Ok(true)
+                }
+                DaemonCommand::Start => {
+                    daemon::platform::start(&config)?;
+                    println!("监控已运行。");
+                    Ok(true)
+                }
+                DaemonCommand::Restart { wait_seconds } => {
+                    daemon::platform::restart(&config, wait_seconds)?;
+                    println!("监控已重新启动。");
+                    Ok(true)
+                }
+                DaemonCommand::Uninstall { wait_seconds } => {
+                    daemon::platform::uninstall(&config, wait_seconds)?;
+                    println!("后台服务已卸载，配置、历史和日志保留。");
+                    Ok(true)
+                }
+                DaemonCommand::Run(options) => {
+                    match daemon::run(&config, &options) {
+                        Ok(()) => Ok(true),
+                        Err(error) if options.managed => {
+                            // Known configuration/storage failures must not trigger manager restart loops.
+                            eprintln!("{error}");
+                            Ok(true)
+                        }
+                        Err(error) => Err(error),
+                    }
+                }
+                DaemonCommand::Stop { wait_seconds } => {
+                    let result = daemon::platform::stop(&config, wait_seconds)?;
+                    println!(
+                        "{}",
+                        if result.forced {
+                            "监控已由系统管理器终止。"
+                        } else if result.was_running {
+                            "监控已正常停止。"
+                        } else {
+                            "监控未运行。"
+                        }
+                    );
+                    Ok(true)
+                }
+                DaemonCommand::Status { json } => {
+                    let status = daemon::local_status(&config)?;
+                    if json {
+                        println!(
+                            "{}",
+                            serde_json::to_string(&status).map_err(|_| "无法序列化监控状态。")?
+                        );
+                    } else {
+                        println!(
+                            "监控：{}；数据目录：{}",
+                            if status.running {
+                                "运行中"
+                            } else {
+                                "未运行"
+                            },
+                            status.data_directory.display()
+                        );
+                        println!(
+                            "后台注册：{}；自启动：{}；管理器状态：{}",
+                            status.service.name.as_deref().unwrap_or("未安装"),
+                            match status.service.autostart {
+                                Some(true) => "开启",
+                                Some(false) => "关闭",
+                                None => "未知 / 未安装",
+                            },
+                            status.service.error.as_deref().unwrap_or(
+                                if status.service.registered {
+                                    "可用"
+                                } else {
+                                    "未注册"
+                                }
+                            )
+                        );
+                        if let Some(runtime) = &status.runtime {
+                            println!(
+                                "状态：{}；最近查询：{}；下次检查：{}",
+                                runtime.status,
+                                runtime.last_attempt_at.as_deref().unwrap_or("尚无"),
+                                runtime.next_check_at.as_deref().unwrap_or("无")
+                            );
+                            if let Some(reading) = &runtime.last_success {
+                                println!(
+                                    "最近成功读数：{} 度（{}）。",
+                                    reading.remaining_kwh, reading.checked_at
+                                );
+                            }
+                            if let Some(error) = &runtime.last_error {
+                                println!("最近错误：{error}");
+                            }
+                            for channel in &runtime.channels {
+                                println!(
+                                    "渠道 {}：{}；最近错误：{}",
+                                    channel.id,
+                                    channel.status,
+                                    channel.last_error.as_deref().unwrap_or("无")
+                                );
+                            }
+                        }
+                    }
+                    Ok(true)
+                }
+                DaemonCommand::TestNotification { channel } => {
+                    daemon::test_notification(&config, channel.as_deref())
+                }
+            }
+        }
         Command::CheckConfig { config } => {
             settings::Settings::load(&config).map_err(|e| e.to_string())?;
             println!("YAML 配置结构有效；账号、设备授信和服务可用性需登录验证。");
@@ -540,20 +678,21 @@ fn main() -> ExitCode {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sdu_infohelper::QueryError;
 
     #[test]
     fn second_factor_requirement_stops_watch_and_requests_attention() {
         assert_eq!(
-            failure_flags(&QueryError::AuthFlow("需要二次验证")),
+            monitor::failure_flags(&QueryError::AuthFlow("需要二次验证")),
             (true, true)
         );
-        assert_eq!(failure_flags(&QueryError::Network), (false, false));
+        assert_eq!(monitor::failure_flags(&QueryError::Network), (false, false));
         for error in [
             QueryError::Http(408),
             QueryError::Http(429),
             QueryError::Response("刷新响应暂不可用"),
         ] {
-            assert_eq!(failure_flags(&error), (false, false));
+            assert_eq!(monitor::failure_flags(&error), (false, false));
         }
     }
 }

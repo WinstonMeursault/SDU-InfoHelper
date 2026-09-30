@@ -13,6 +13,9 @@ pub mod aircon;
 pub mod auth;
 mod cas;
 mod cas_des;
+pub mod daemon;
+pub mod monitor;
+pub mod notification;
 pub mod settings;
 
 pub const ENDPOINT: &str = "https://mcard.sdu.edu.cn/charge/feeitem/getThirdData";
@@ -222,7 +225,7 @@ impl Config {
     }
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct Location {
     pub campus: String,
     pub building: String,

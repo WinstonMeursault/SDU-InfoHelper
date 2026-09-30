@@ -19,3 +19,28 @@ dorm_electricity:
   building: null
   floor: null
   room: null
+
+# 后台监控：阈值单位为度，严格低于阈值才提醒；周期单位为秒。
+daemon:
+  threshold_kwh: "10"
+  interval_seconds: 21600
+  repeat_after_seconds: 86400
+  query_timeout_seconds: 20
+  history: .local/electricity/history.sqlite3
+
+# 填入本机凭据后将需要的渠道 enabled 改为 true；daemon 至少需要一个启用渠道。
+# 渠道 id 必须唯一，用于独立记录提醒冷却和发送状态。
+notifications:
+  channels:
+    - id: pushdeer-main
+      type: pushdeer
+      enabled: false
+      pushkey: ""
+      endpoint: "https://api2.pushdeer.com" # 自架服务可替换地址
+      timeout_seconds: 10
+    - id: webhook-main
+      type: webhook
+      enabled: false
+      url: ""
+      headers: {} # 例如 Authorization: "Bearer 本机凭据"
+      timeout_seconds: 10

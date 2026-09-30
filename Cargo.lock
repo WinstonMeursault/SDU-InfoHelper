@@ -1702,13 +1702,14 @@ dependencies = [
 
 [[package]]
 name = "sdu-infohelper"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "base64 0.22.1",
  "chrono",
  "clap",
  "fs2",
  "hex",
+ "libc",
  "md-5",
  "rand 0.8.8",
  "regex",

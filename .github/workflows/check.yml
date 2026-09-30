@@ -24,6 +24,15 @@ jobs:
         run: cargo +stable test --locked
       - name: Check Rust diagnostics
         run: cargo +stable clippy --locked --all-targets -- -D warnings
+      - name: Prepare Linux user service session
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          sudo loginctl enable-linger "$USER"
+          sudo systemctl start "user@$(id -u).service"
+          echo "XDG_RUNTIME_DIR=/run/user/$(id -u)" >> "$GITHUB_ENV"
+      - name: Test native user service lifecycle
+        run: cargo +stable test --locked --test daemon_native -- --ignored --nocapture
 
   docker:
     runs-on: ubuntu-24.04
