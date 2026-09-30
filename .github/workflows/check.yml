@@ -35,7 +35,7 @@ jobs:
         run: docker run --rm sdu-infohelper:ci --version
 
   dockerhub_auth:
-    if: github.event_name == 'push'
+    if: github.event_name == 'push' && vars.DOCKERHUB_USERNAME != ''
     runs-on: ubuntu-24.04
     steps:
       - name: Verify Docker Hub credentials

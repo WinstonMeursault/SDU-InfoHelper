@@ -349,7 +349,11 @@ impl Service {
         if old != serde_json::to_string(prefs).map_err(|_| ServiceError::Storage)? {
             store::cancel(&transaction, "low")?;
             crate::clear_alert(&transaction, "low")?;
-            profile.next_check_at = 0;
+            // Changes may bring the next check forward, but must not let a
+            // client bypass the scheduler's five-minute minimum by toggling.
+            profile.next_check_at = profile
+                .last_check_at
+                .map_or(0, |last| last.saturating_add(300));
         }
         if !profile.preferences.enabled {
             store::cancel(&transaction, "auth")?;
@@ -687,29 +691,35 @@ impl Service {
         }
         let mut deliveries = Vec::new();
         for actor in self.actors(Some(bot_id))? {
-            let guard = match self.guard(&actor) {
-                Ok(guard) => guard,
-                Err(ServiceError::Busy | ServiceError::NotBound) => continue,
-                Err(error) => return Err(error),
-            };
-            let mut connection = guard.database()?;
-            let transaction = connection.transaction()?;
-            transaction.execute("UPDATE outbox SET state='cancelled',lease_token=NULL WHERE state IN ('pending','leased') AND created_at<?1", [now.saturating_sub(86400)])?;
-            let entry: Option<(String,String,u32)> = transaction.query_row(
+            let claim = (|| -> Result<Option<Delivery>, ServiceError> {
+                let guard = self.guard(&actor)?;
+                let mut connection = guard.database()?;
+                let transaction = connection.transaction()?;
+                transaction.execute("UPDATE outbox SET state='cancelled',lease_token=NULL WHERE state IN ('pending','leased') AND created_at<?1", [now.saturating_sub(86400)])?;
+                let entry: Option<(String,String,u32)> = transaction.query_row(
                 "SELECT id,message,attempts FROM outbox WHERE (state='pending' AND retry_at<=?1) OR (state='leased' AND lease_until<=?1) ORDER BY created_at LIMIT 1",
                 [now], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?))).optional()?;
-            if let Some((id, message, attempts)) = entry {
-                let lease_token = fresh_id();
-                transaction.execute("UPDATE outbox SET state='leased',lease_token=?1,lease_until=?2,attempts=attempts+1 WHERE id=?3", params![lease_token,now.saturating_add(120),id])?;
-                deliveries.push(Delivery {
-                    actor,
-                    notification_id: id,
-                    lease_token,
-                    message,
-                    attempts: attempts + 1,
-                });
+                let delivery = if let Some((id, message, attempts)) = entry {
+                    let lease_token = fresh_id();
+                    transaction.execute("UPDATE outbox SET state='leased',lease_token=?1,lease_until=?2,attempts=attempts+1 WHERE id=?3", params![lease_token,now.saturating_add(120),id])?;
+                    Some(Delivery {
+                        actor: actor.clone(),
+                        notification_id: id,
+                        lease_token,
+                        message,
+                        attempts: attempts + 1,
+                    })
+                } else {
+                    None
+                };
+                transaction.commit()?;
+                Ok(delivery)
+            })();
+            // A broken tenant store must not discard leases already claimed
+            // from healthy tenants or stop their private notifications.
+            if let Ok(Some(delivery)) = claim {
+                deliveries.push(delivery);
             }
-            transaction.commit()?;
             if deliveries.len() >= limit as usize {
                 break;
             }
@@ -768,17 +778,21 @@ impl Service {
             };
             let guard = match self.guard(&delivery.actor) {
                 Ok(guard) => guard,
-                Err(ServiceError::Busy | ServiceError::NotBound) => continue,
-                Err(error) => return Err(error),
+                Err(_) => continue,
             };
-            let connection = guard.database()?;
-            let valid: bool = connection.query_row("SELECT EXISTS(SELECT 1 FROM outbox WHERE id=?1 AND state='leased' AND lease_token=?2 AND lease_until>?3)", params![delivery.notification_id,delivery.lease_token,now], |row| row.get(0))?;
-            if !valid {
+            let valid = (|| -> Result<bool, ServiceError> {
+                let connection = guard.database()?;
+                Ok(connection.query_row("SELECT EXISTS(SELECT 1 FROM outbox WHERE id=?1 AND state='leased' AND lease_token=?2 AND lease_until>?3)", params![delivery.notification_id,delivery.lease_token,now], |row| row.get(0))?)
+            })();
+            if !matches!(valid, Ok(true)) {
                 continue;
             }
             let success = sink.send_private(&delivery).is_ok();
-            self.complete_locked(&guard, &delivery, success, Utc::now().timestamp())?;
-            if success {
+            if self
+                .complete_locked(&guard, &delivery, success, Utc::now().timestamp())
+                .is_ok()
+                && success
+            {
                 sent += 1;
             }
         }

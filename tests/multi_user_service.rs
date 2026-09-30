@@ -476,6 +476,72 @@ fn rate_limits_and_invalid_preferences_do_not_affect_other_users() {
 }
 
 #[test]
+fn changing_preferences_cannot_bypass_the_scheduled_query_minimum() {
+    let f = Fixture::new();
+    let backend = Backend::new();
+    f.service.query_with(&f.alice, &backend, 1000).unwrap();
+    f.service
+        .preferences(
+            &f.alice,
+            PreferencePatch {
+                threshold_kwh: Some("6".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    f.service
+        .preferences(
+            &f.alice,
+            PreferencePatch {
+                enabled: Some(false),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    f.service
+        .preferences(
+            &f.alice,
+            PreferencePatch {
+                enabled: Some(true),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    assert_eq!(f.service.status(&f.alice).unwrap().next_check_at, 1300);
+    assert_eq!(f.service.tick_with(&backend, 1299).unwrap().checked, 0);
+    assert_eq!(backend.calls.lock().unwrap().len(), 1);
+    assert_eq!(f.service.tick_with(&backend, 1300).unwrap().checked, 1);
+    assert_eq!(backend.calls.lock().unwrap().len(), 2);
+}
+
+#[test]
+fn corrupt_tenant_storage_does_not_block_other_users_notifications() {
+    let f = Fixture::new();
+    let backend = Backend::new();
+    let now = chrono::Utc::now().timestamp();
+    backend.set("bob", Outcome::Energy("5"));
+    for actor in [&f.alice, &f.bob] {
+        f.service.query_with(actor, &backend, now).unwrap();
+    }
+    fs::write(
+        f.user_dir(&f.alice).join("history.sqlite3"),
+        b"corrupt database",
+    )
+    .unwrap();
+    assert!(matches!(
+        f.service.status(&f.alice),
+        Err(ServiceError::Storage)
+    ));
+    let mut sink = RecordingSink {
+        success: true,
+        recipients: Vec::new(),
+    };
+    assert_eq!(f.service.dispatch("90001", &mut sink).unwrap(), 1);
+    assert_eq!(sink.recipients, ["10002"]);
+    assert!(f.service.outbox(&f.bob).unwrap().is_empty());
+}
+
+#[test]
 fn unbinding_erases_one_user_and_old_deliveries_never_reach_rebound_user() {
     let f = Fixture::new();
     let backend = Backend::new();
