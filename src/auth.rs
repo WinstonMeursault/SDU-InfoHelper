@@ -43,6 +43,9 @@ pub struct TokenCache {
     #[serde(default)]
     pub logintype: String,
     pub client_authorization: Option<String>,
+    /// Local account binding; omitted for imports without a configured CAS account.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cas_username: Option<String>,
 }
 
 fn claim(token: &str, key: &str) -> Option<Value> {
@@ -101,7 +104,13 @@ impl TokenCache {
             provider,
             logintype: nonempty(data.get("logintype")).unwrap_or_default(),
             client_authorization: None,
+            cas_username: None,
         })
+    }
+    fn matches_account(&self, settings: &Settings) -> bool {
+        settings
+            .cas_username()
+            .is_none_or(|username| self.cas_username.as_deref() == Some(username))
     }
     fn usable(&self, now: i64) -> bool {
         self.expires_at
@@ -111,6 +120,7 @@ impl TokenCache {
         // Some providers rotate refresh tokens, others omit an unchanged one.
         self.refresh_token = self.refresh_token.or_else(|| old.refresh_token.clone());
         self.client_authorization = old.client_authorization.clone();
+        self.cas_username = old.cas_username.clone();
         if self.logintype.is_empty() {
             self.logintype = old.logintype.clone();
         }
@@ -287,8 +297,20 @@ fn cas_token(
     options: LoginOptions,
 ) -> Result<TokenCache, QueryError> {
     let credentials = credentials(path)?;
+    let mut cache = cas_token_for_credentials(settings, path, timeout, &credentials, options)?;
+    cache.cas_username = Some(credentials.username);
+    Ok(cache)
+}
+
+fn cas_token_for_credentials(
+    settings: &Settings,
+    path: &Path,
+    timeout: Duration,
+    credentials: &Credentials,
+    options: LoginOptions,
+) -> Result<TokenCache, QueryError> {
     let client = cas::client(timeout)?;
-    let response = cas::login(&client, cas::DORM_ENTRY, &credentials, options)?;
+    let response = cas::login(&client, cas::DORM_ENTRY, credentials, options)?;
     let url = response.url().clone();
     if let Some(cache) = cache_from_url(&url) {
         return Ok(cache);
@@ -432,6 +454,12 @@ fn discover_client(client: &Client, cache: &TokenCache) -> Result<String, QueryE
         .header("synjones-auth", &auth)
         .send()
         .map_err(|_| QueryError::Network)?;
+    if matches!(response.status().as_u16(), 401 | 403) || response.status().is_redirection() {
+        return Err(QueryError::Authentication);
+    }
+    if !response.status().is_success() {
+        return Err(QueryError::Http(response.status().as_u16()));
+    }
     let html = response.text().map_err(|_| QueryError::Network)?;
     let document = Html::parse_document(&html);
     let scripts = Selector::parse("script[src]").unwrap();
@@ -453,6 +481,12 @@ fn discover_client(client: &Client, cache: &TokenCache) -> Result<String, QueryE
             .header("synjones-auth", &auth)
             .send()
             .map_err(|_| QueryError::Network)?;
+        if matches!(response.status().as_u16(), 401 | 403) || response.status().is_redirection() {
+            return Err(QueryError::Authentication);
+        }
+        if !response.status().is_success() {
+            return Err(QueryError::Http(response.status().as_u16()));
+        }
         let text = response.text().map_err(|_| QueryError::Network)?;
         for found in pattern.captures_iter(&text) {
             if let Ok(decoded) = STANDARD.decode(&found[1])
@@ -504,16 +538,34 @@ fn refresh_request(
                 QueryError::Network
             }
         })?;
-    if !response.status().is_success() {
-        if response.status().is_server_error() {
-            return Err(QueryError::Http(response.status().as_u16()));
-        }
+    let status = response.status();
+    if matches!(status.as_u16(), 401 | 403) {
         return Err(QueryError::Authentication);
+    }
+    // OAuth invalid_grant commonly uses HTTP 400. Other HTTP errors, including
+    // timeouts and rate limits, must remain retryable rather than trigger CAS.
+    if !status.is_success() && status.as_u16() != 400 {
+        return Err(QueryError::Http(status.as_u16()));
     }
     let payload: Value = response
         .json()
-        .map_err(|_| QueryError::AuthFlow("令牌刷新响应格式错误。"))?;
-    let mut new = TokenCache::from_response(&payload, old.provider, Utc::now().timestamp())?
+        .map_err(|_| QueryError::Response("令牌刷新响应格式错误，请稍后重试。"))?;
+    if matches!(
+        payload.get("error").and_then(Value::as_str),
+        Some("invalid_grant" | "invalid_token" | "invalid_client" | "unauthorized_client")
+    ) || matches!(number(payload.get("code")), Some(401 | 403))
+    {
+        return Err(QueryError::Authentication);
+    }
+    if !status.is_success() {
+        return Err(QueryError::Http(status.as_u16()));
+    }
+    if payload.get("error").is_some() || number(payload.get("code")).is_some_and(|code| code != 200)
+    {
+        return Err(QueryError::Response("令牌刷新暂未成功，请稍后重试。"));
+    }
+    let mut new = TokenCache::from_response(&payload, old.provider, Utc::now().timestamp())
+        .map_err(|_| QueryError::Response("令牌刷新响应缺少有效凭据，请稍后重试。"))?
         .merged_refresh(old);
     new.client_authorization = Some(authorization.into());
     Ok(new)
@@ -526,27 +578,46 @@ pub fn token(
     timeout: Duration,
     rejected: Option<&str>,
 ) -> Result<TokenCache, QueryError> {
+    token_with(
+        settings,
+        path,
+        rejected,
+        |cache| refresh(&crate::client(timeout)?, cache),
+        || cas_token(settings, path, timeout, LoginOptions::default()),
+    )
+}
+
+fn token_with(
+    settings: &Settings,
+    path: &Path,
+    rejected: Option<&str>,
+    refresh: impl FnOnce(&TokenCache) -> Result<TokenCache, QueryError>,
+    login: impl FnOnce() -> Result<TokenCache, QueryError>,
+) -> Result<TokenCache, QueryError> {
     let cache_path = settings.cache_path(path);
     let _lock = lock(&cache_path)?;
     let cache = load_cache(&cache_path)?;
-    if let Some(cache) = &cache {
+    if let Some(cache) = cache
+        .as_ref()
+        .filter(|cache| cache.matches_account(settings))
+    {
         if cache.usable(Utc::now().timestamp()) && rejected != Some(cache.access_token.as_str()) {
             return Ok(cache.clone());
         }
         if cache.refresh_token.is_some() {
-            match refresh(&crate::client(timeout)?, cache) {
+            match refresh(cache) {
                 Ok(new) => {
                     save_cache(&cache_path, &new)?;
                     return Ok(new);
                 }
-                Err(error @ (QueryError::Network | QueryError::Timeout | QueryError::Http(_))) => {
-                    return Err(error);
-                }
-                Err(_) => {} // Invalid / expired refresh grant falls back to normal CAS.
+                // Invalid grants and an unavailable client configuration can be
+                // recovered through CAS. Service/response failures keep the cache.
+                Err(QueryError::Authentication | QueryError::AuthFlow(_)) => {}
+                Err(error) => return Err(error),
             }
         }
     }
-    let new = cas_token(settings, path, timeout, LoginOptions::default())?;
+    let new = login()?;
     save_cache(&cache_path, &new)?;
     Ok(new)
 }
@@ -595,7 +666,9 @@ impl AuthStatus {
 pub fn status(path: &Path) -> Result<AuthStatus, QueryError> {
     let settings = Settings::load(path)?;
     Ok(AuthStatus::from_cache(
-        load_cache(&settings.cache_path(path))?.as_ref(),
+        load_cache(&settings.cache_path(path))?
+            .as_ref()
+            .filter(|cache| cache.matches_account(&settings)),
     ))
 }
 
@@ -632,6 +705,7 @@ pub fn import(
     } else {
         TokenCache::from_response(&payload, provider, Utc::now().timestamp())?
     };
+    cache.cas_username = settings.cas_username().map(str::to_owned);
     if let Some(file) = client_auth {
         let authorization = fs::read_to_string(file)
             .map_err(|_| QueryError::Config("无法读取本地 OAuth 客户端认证文件。"))?;
@@ -666,6 +740,206 @@ pub fn aircon_session(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn changed_accounts_and_unbound_legacy_caches_are_never_reused_or_refreshed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.yaml");
+        secure_write(&path, b"cas:\n  username: new-account\n  password: ''\n").unwrap();
+        let settings = Settings::load(&path).unwrap();
+        let cache_path = settings.cache_path(&path);
+        let mut cache = TokenCache::from_response(
+            &serde_json::json!({"access_token":"old-access","refresh_token":"old-refresh","expires_in":3600}),
+            OAuthProvider::Berserker,
+            Utc::now().timestamp(),
+        ).unwrap();
+        for account in [Some("old-account"), None] {
+            cache.cas_username = account.map(str::to_owned);
+            save_cache(&cache_path, &cache).unwrap();
+            let before = fs::read(&cache_path).unwrap();
+            // Empty CAS password fails locally. If the old token were reused this
+            // would succeed; refreshing it would attempt a network request.
+            assert!(matches!(
+                token(&settings, &path, Duration::from_secs(1), None),
+                Err(QueryError::AuthFlow(_))
+            ));
+            assert!(!status(&path).unwrap().cached);
+            assert_eq!(fs::read(&cache_path).unwrap(), before);
+        }
+        cache.cas_username = Some("new-account".into());
+        save_cache(&cache_path, &cache).unwrap();
+        assert_eq!(
+            token(&settings, &path, Duration::from_secs(1), None)
+                .unwrap()
+                .access_token,
+            "old-access"
+        );
+        assert!(status(&path).unwrap().cached);
+    }
+
+    #[test]
+    fn imports_bind_to_the_configured_account_and_support_token_only_configs() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.yaml");
+        let input = dir.path().join("response.json");
+        secure_write(
+            &input,
+            br#"{"access_token":"imported-access","cas_username":"untrusted-input"}"#,
+        )
+        .unwrap();
+        for (config, account) in [
+            (
+                "cas:\n  username: current-account\n  password: ''\n",
+                Some("current-account"),
+            ),
+            ("cas: null\n", None),
+            ("cas:\n  username: ''\n  password: ''\n", None),
+        ] {
+            secure_write(&path, config.as_bytes()).unwrap();
+            import(&path, &input, OAuthProvider::Berserker, None).unwrap();
+            let settings = Settings::load(&path).unwrap();
+            let cache = load_cache(&settings.cache_path(&path)).unwrap().unwrap();
+            assert_eq!(cache.cas_username.as_deref(), account);
+            assert_eq!(
+                token(&settings, &path, Duration::from_secs(1), None)
+                    .unwrap()
+                    .access_token,
+                "imported-access"
+            );
+        }
+    }
+
+    #[test]
+    fn rejected_refresh_grants_relogin_and_replace_the_cache() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.yaml");
+        let settings = Settings::default();
+        let old = TokenCache::from_response(
+            &serde_json::json!({"access_token":"old-access","refresh_token":"old-refresh"}),
+            OAuthProvider::Berserker,
+            0,
+        )
+        .unwrap();
+        save_cache(&settings.cache_path(&path), &old).unwrap();
+        let mut refreshed = false;
+        let mut logged_in = false;
+        let new = token_with(
+            &settings,
+            &path,
+            Some("old-access"),
+            |_| {
+                refreshed = true;
+                Err(QueryError::Authentication)
+            },
+            || {
+                logged_in = true;
+                TokenCache::from_response(
+                    &serde_json::json!({"access_token":"new-access","refresh_token":"new-refresh"}),
+                    OAuthProvider::Berserker,
+                    0,
+                )
+            },
+        )
+        .unwrap();
+        assert!(refreshed && logged_in);
+        assert_eq!(new.access_token, "new-access");
+        assert_eq!(
+            load_cache(&settings.cache_path(&path))
+                .unwrap()
+                .unwrap()
+                .refresh_token
+                .as_deref(),
+            Some("new-refresh")
+        );
+    }
+
+    #[test]
+    fn temporary_refresh_failures_remain_retryable() {
+        use std::{
+            io::{Read, Write},
+            net::TcpListener,
+            thread,
+        };
+        let cases = [
+            ("408 Request Timeout", r#"{}"#),
+            ("429 Too Many Requests", r#"{}"#),
+            (
+                "400 Bad Request",
+                r#"{"error":"temporarily_unavailable","error_description":"must-not-be-logged"}"#,
+            ),
+            (
+                "200 OK",
+                r#"{"error":"temporarily_unavailable","error_description":"must-not-be-logged"}"#,
+            ),
+            ("200 OK", r#"{"code":500}"#),
+            ("200 OK", "<html>service unavailable</html>"),
+            ("200 OK", r#"{}"#),
+        ];
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = format!("http://{}/token", listener.local_addr().unwrap());
+        let server = thread::spawn(move || {
+            for (status, body) in cases {
+                let (mut stream, _) = listener.accept().unwrap();
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(5)))
+                    .unwrap();
+                let mut bytes = Vec::new();
+                let mut buffer = [0; 4096];
+                loop {
+                    let count = stream.read(&mut buffer).unwrap();
+                    assert!(count > 0);
+                    bytes.extend_from_slice(&buffer[..count]);
+                    let text = String::from_utf8_lossy(&bytes);
+                    if let Some((headers, body)) = text.split_once("\r\n\r\n") {
+                        let length = headers
+                            .lines()
+                            .find_map(|line| {
+                                line.to_ascii_lowercase()
+                                    .strip_prefix("content-length: ")
+                                    .and_then(|n| n.parse::<usize>().ok())
+                            })
+                            .unwrap();
+                        if body.len() >= length {
+                            break;
+                        }
+                    }
+                }
+                write!(stream, "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+            }
+        });
+        let old = TokenCache::from_response(
+            &serde_json::json!({"access_token":"access","refresh_token":"refresh"}),
+            OAuthProvider::Berserker,
+            0,
+        )
+        .unwrap();
+        let client = crate::client(Duration::from_secs(5)).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.yaml");
+        let settings = Settings::default();
+        let cache_path = settings.cache_path(&path);
+        save_cache(&cache_path, &old).unwrap();
+        let before = fs::read(&cache_path).unwrap();
+        for (status, _) in cases {
+            let error = token_with(
+                &settings,
+                &path,
+                Some("access"),
+                |cache| refresh_request(&client, cache, &endpoint, "Basic dGVzdDpwdWJsaWM="),
+                || panic!("temporary refresh failure must not trigger CAS"),
+            )
+            .err()
+            .unwrap();
+            if status.starts_with("200") {
+                assert!(matches!(error, QueryError::Response(_)), "{error:?}");
+            } else {
+                assert!(matches!(error, QueryError::Http(_)), "{error:?}");
+            }
+            assert!(!error.to_string().contains("must-not-be-logged"));
+            assert_eq!(fs::read(&cache_path).unwrap(), before);
+        }
+        server.join().unwrap();
+    }
 
     #[test]
     fn device_initialization_is_stable_and_preserves_credentials() {
@@ -708,6 +982,9 @@ mod tests {
                     r#"{"error":"invalid_grant","error_description":"must-not-be-logged"}"#,
                 ),
                 ("503 Service Unavailable", r#"{}"#),
+                ("401 Unauthorized", r#"{}"#),
+                ("403 Forbidden", r#"{}"#),
+                ("200 OK", r#"{"error":"invalid_grant"}"#),
             ] {
                 let (mut stream, _) = listener.accept().unwrap();
                 stream
@@ -747,16 +1024,18 @@ mod tests {
                 write!(stream,"HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",body.len()).unwrap();
             }
         });
-        let old = TokenCache::from_response(
+        let mut old = TokenCache::from_response(
             &serde_json::json!({"access_token":"old-access","refresh_token":"old+refresh&value"}),
             OAuthProvider::Berserker,
             0,
         )
         .unwrap();
+        old.cas_username = Some("current-account".into());
         let client = crate::client(Duration::from_secs(5)).unwrap();
         let new = refresh_request(&client, &old, &endpoint, "Basic dGVzdDpwdWJsaWM=").unwrap();
         assert_eq!(new.access_token, "new-access");
         assert_eq!(new.refresh_token.as_deref(), Some("rotated-refresh"));
+        assert_eq!(new.cas_username.as_deref(), Some("current-account"));
         let error = refresh_request(&client, &old, &endpoint, "Basic dGVzdDpwdWJsaWM=")
             .err()
             .unwrap();
@@ -766,6 +1045,12 @@ mod tests {
             refresh_request(&client, &old, &endpoint, "Basic dGVzdDpwdWJsaWM="),
             Err(QueryError::Http(503))
         ));
+        for _ in 0..3 {
+            assert!(matches!(
+                refresh_request(&client, &old, &endpoint, "Basic dGVzdDpwdWJsaWM="),
+                Err(QueryError::Authentication)
+            ));
+        }
         assert_eq!(old.refresh_token.as_deref(), Some("old+refresh&value"));
         server.join().unwrap();
     }

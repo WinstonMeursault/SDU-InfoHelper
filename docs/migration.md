@@ -16,6 +16,10 @@
 `aircon.building`、`floor`、`room` 保持数字配置；查询前需填写完整有效目标。
 `dorm_electricity` 现在实际启用，可接受目录的完整值或唯一匹配的名称/数字。
 新增 `auth.cache` 指定独立令牌缓存，相对路径以配置文件所在目录为基准。
+认证缓存现在记录 CAS 账号归属，避免切换账号后继续使用旧凭据。
+已有缓存若没有 `cas_username` 且配置了 CAS 账号，查询时会重新通过 CAS 登录；
+若需要二次验证，运行 `auth login --trust-device`。也可用当前账号的 OAuth 响应
+运行 `auth import`；仅 Token 模式（CAS 账号留空）不受影响。
 
 电量 JSON 的 `remaining_kwh` 改为十进制字符串，避免浮点舍入。
 新的 `aircon --json` 返回 `building`、`floor`、`room` 和 `remaining_kwh`，

@@ -12,8 +12,8 @@ use clap::{Args, Parser, Subcommand};
 use rust_decimal::Decimal;
 use sdu_infohelper::{
     Event, Location, QueryError, SelectionLevel, aircon, alert_due, auth, clear_alert, history,
-    mark_alert, query, save_event, selection_options, settings, with_dorm_auth,
-    with_dorm_directory_auth,
+    mark_alert, query, save_event, selection_options, settings, with_dorm_auth_overrides,
+    with_dorm_directory_auth_overrides,
 };
 
 #[derive(Parser)]
@@ -225,11 +225,11 @@ fn failure_flags(error: &QueryError) -> (bool, bool) {
 
 fn event(args: &QueryArgs) -> (Event, bool, bool) {
     let mut target = None;
-    let result = with_dorm_auth(
+    let result = with_dorm_auth_overrides(
         &args.config,
         Duration::from_secs(args.timeout),
+        &args.location.overrides(),
         |config, connection| {
-            let config = config.with_location_overrides(&args.location.overrides())?;
             if config.form.values().any(|value| value == "_") {
                 return Err(QueryError::Config(
                     "请配置完整 dorm_electricity 目标，或使用 --campus --building --floor --room 指定。",
@@ -237,7 +237,7 @@ fn event(args: &QueryArgs) -> (Event, bool, bool) {
             }
             let location = config.location()?;
             target = Some(location.clone());
-            let reading = query(&config, connection)?;
+            let reading = query(config, connection)?;
             Ok(
                 Event::success(reading, args.threshold, config.expiry_claim())
                     .at_location(location),
@@ -377,11 +377,14 @@ fn run(cli: Cli) -> Result<bool, String> {
             .into_iter()
             .filter_map(|(key, value)| value.map(|value| (key.to_owned(), value)))
             .collect();
-            let options = with_dorm_directory_auth(
+            let options = with_dorm_directory_auth_overrides(
                 &args.config,
                 Duration::from_secs(args.timeout),
                 args.level,
-                |config, connection| selection_options(config, connection, args.level, &overrides),
+                &overrides,
+                |config, connection| {
+                    selection_options(config, connection, args.level, &BTreeMap::new())
+                },
             )
             .map_err(|error| error.to_string())?;
             if args.json {
@@ -545,5 +548,12 @@ mod tests {
             (true, true)
         );
         assert_eq!(failure_flags(&QueryError::Network), (false, false));
+        for error in [
+            QueryError::Http(408),
+            QueryError::Http(429),
+            QueryError::Response("刷新响应暂不可用"),
+        ] {
+            assert_eq!(failure_flags(&error), (false, false));
+        }
     }
 }

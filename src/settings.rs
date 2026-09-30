@@ -90,6 +90,66 @@ pub struct Settings {
 }
 
 impl Settings {
+    pub(crate) fn cas_username(&self) -> Option<&str> {
+        self.cas
+            .as_ref()
+            .map(|credentials| credentials.username.as_str())
+            .filter(|username| !username.trim().is_empty())
+    }
+
+    pub(crate) fn with_dorm_overrides(
+        &self,
+        overrides: &BTreeMap<String, String>,
+        depth: usize,
+    ) -> Result<Self, QueryError> {
+        let mut settings = self.clone();
+        let target = &mut settings.dorm_electricity;
+        let derived_floor = target
+            .room
+            .as_ref()
+            .and_then(|room| room.text().parse::<u16>().ok())
+            .filter(|room| *room >= 100)
+            .map(|room| (room / 100).to_string());
+        let mut fields = [
+            ("campus", &mut target.campus),
+            ("building", &mut target.building),
+            ("floor", &mut target.floor),
+            ("room", &mut target.room),
+        ];
+        let fields = &mut fields[..depth];
+        if overrides.iter().any(|(key, value)| {
+            value.trim().is_empty() || !fields.iter().any(|(name, _)| *name == key)
+        }) {
+            return Err(QueryError::Config("宿舍覆盖参数不匹配该查询层级。"));
+        }
+        for (index, (key, original)) in fields.iter().enumerate() {
+            let original = original.as_ref().map(SelectorValue::text);
+            let original = original.or_else(|| match *key {
+                "campus" => Some("主校区".into()),
+                "floor" => derived_floor.clone(),
+                _ => None,
+            });
+            if overrides.get(*key).is_some_and(|value| {
+                original
+                    .as_deref()
+                    .is_none_or(|original| !same_selector(original, value))
+            }) && fields[index + 1..]
+                .iter()
+                .any(|(child, _)| !overrides.contains_key(*child))
+            {
+                return Err(QueryError::Config(
+                    "更换上级目录时，请同时指定查询所需的下级宿舍参数。",
+                ));
+            }
+        }
+        for (key, value) in fields {
+            if let Some(override_value) = overrides.get(*key) {
+                **value = Some(SelectorValue::Text(override_value.clone()));
+            }
+        }
+        Ok(settings)
+    }
+
     pub fn load(path: &Path) -> Result<Self, QueryError> {
         let text = fs::read_to_string(path).map_err(|_| {
             QueryError::Config("无法读取 config.yaml，请复制 config.example.yaml 后在本机填写。")
@@ -195,6 +255,18 @@ impl Settings {
     }
 }
 
+fn same_selector(original: &str, replacement: &str) -> bool {
+    if original == replacement {
+        return true;
+    }
+    match (original.split_once('&'), replacement.split_once('&')) {
+        (Some((original_id, _)), Some((replacement_id, _))) => original_id == replacement_id,
+        (Some((_, name)), None) => name == replacement,
+        (None, Some((_, name))) => original == name,
+        (None, None) => false,
+    }
+}
+
 fn select_name(
     options: &[crate::SelectionOption],
     value: &str,
@@ -242,5 +314,51 @@ mod tests {
         }];
         assert_eq!(select_name(&options, "405", true).unwrap(), "server-id&05");
         assert!(select_name(&options, "406", true).is_err());
+    }
+
+    #[test]
+    fn merged_targets_validate_required_descendants_and_query_depth() {
+        let settings: Settings = serde_yaml::from_str(
+            "dorm_electricity:\n  campus: C&Campus\n  building: removed-building\n  floor: removed-floor\n  room: removed-room\n",
+        ).unwrap();
+        let mut overrides = BTreeMap::from([("building".into(), "B&Building".into())]);
+        assert!(settings.with_dorm_overrides(&overrides, 4).is_err());
+        assert!(settings.with_dorm_overrides(&overrides, 2).is_ok());
+        overrides.insert("floor".into(), "F&Floor".into());
+        assert!(settings.with_dorm_overrides(&overrides, 3).is_ok());
+        assert!(settings.with_dorm_overrides(&overrides, 4).is_err());
+        overrides.insert("room".into(), "R&Room".into());
+        let merged = settings.with_dorm_overrides(&overrides, 4).unwrap();
+        assert_eq!(
+            merged.dorm_electricity.building.unwrap().text(),
+            "B&Building"
+        );
+        assert_eq!(
+            settings.dorm_electricity.building.as_ref().unwrap().text(),
+            "removed-building"
+        );
+        assert!(settings.with_dorm_overrides(&overrides, 3).is_err());
+        assert!(
+            settings
+                .with_dorm_overrides(&BTreeMap::from([("room".into(), " ".into())]), 4)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn equivalent_directory_values_keep_the_existing_descendants() {
+        let settings: Settings = serde_yaml::from_str(
+            "dorm_electricity:\n  campus: 主校区\n  building: B&8\n  room: 405\n",
+        )
+        .unwrap();
+        for (key, value) in [("campus", "C&主校区"), ("building", "8"), ("floor", "F&4")] {
+            assert!(
+                settings
+                    .with_dorm_overrides(&BTreeMap::from([(key.into(), value.into())]), 4)
+                    .is_ok()
+            );
+        }
+        assert!(!same_selector("B1&8", "B2&8"));
+        assert!(same_selector("B1&Old name", "B1&New name"));
     }
 }
