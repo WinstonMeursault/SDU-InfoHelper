@@ -72,7 +72,9 @@ pub(super) fn windows_launcher(reg: &Registration) -> String {
 pub(super) fn definition(reg: &Registration) -> Vec<u8> {
     match reg.platform {
         Platform::Linux => {
-            let mut args = vec![format!(":{}", systemd(&reg.binary))];
+            // systemd rejects quotes/backslashes in the executable token even after
+            // unquoting. env execs the binary directly and permits arbitrary path arguments.
+            let mut args = vec![":/usr/bin/env".into(), "--".into(), systemd(&reg.binary)];
             args.extend(reg.arguments.iter().map(|arg| systemd(arg)));
             format!("[Unit]\nDescription=SDU-InfoHelper electricity daemon\nStartLimitIntervalSec=120\nStartLimitBurst=3\n\n[Service]\nType=exec\nExecStart={}\nWorkingDirectory={}\nRestart=on-failure\nRestartSec=30\nTimeoutStopSec=30\nUMask=0077\nStandardOutput=null\nStandardError=journal\n\n[Install]\nWantedBy=default.target\n", args.join(" "), reg.working_directory.replace('%', "%%")).into_bytes()
         }

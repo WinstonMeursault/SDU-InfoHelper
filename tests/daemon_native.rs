@@ -9,14 +9,25 @@ use std::{
 };
 
 fn cli(config: &Path, args: &[&str]) -> std::process::Output {
-    Command::new(env!("CARGO_BIN_EXE_sdu-infohelper"))
-    .env_remove("SDU_INFOHELPER_HISTORY")
-    .env_remove("SDU_INFOHELPER_CONFIG")
-    .args(["daemon", "--config"])
-    .arg(config)
-    .args(args)
-    .output()
-    .unwrap()
+    Command::new(test_binary(config))
+        .env_remove("SDU_INFOHELPER_HISTORY")
+        .env_remove("SDU_INFOHELPER_CONFIG")
+        .args(["daemon", "--config"])
+        .arg(config)
+        .args(args)
+        .output()
+        .unwrap()
+}
+fn test_binary(config: &Path) -> std::path::PathBuf {
+    config
+        .parent()
+        .unwrap()
+        .join("程序 binary $ % '")
+        .join(if cfg!(windows) {
+            "sdu-infohelper.exe"
+        } else {
+            "sdu-infohelper"
+        })
 }
 fn ok(config: &Path, args: &[&str]) {
     let output = cli(config, args);
@@ -73,6 +84,9 @@ fn native_install_start_restart_autostart_stop_uninstall() {
     let folder = dir.path().join("中文 config $ % ' space");
     fs::create_dir(&folder).unwrap();
     let config = folder.join("config.yaml");
+    let binary = test_binary(&config);
+    fs::create_dir(binary.parent().unwrap()).unwrap();
+    fs::copy(env!("CARGO_BIN_EXE_sdu-infohelper"), &binary).unwrap();
     // A closed loopback port provides deterministic delivery failure without real credentials.
     fs::write(&config, "daemon:\n  interval_seconds: 60\nnotifications:\n  channels:\n    - type: webhook\n      id: native-test\n      url: http://127.0.0.1:1/test\n      timeout_seconds: 1\n").unwrap();
     let _cleanup = Cleanup(&config);
