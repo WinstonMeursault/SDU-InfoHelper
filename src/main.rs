@@ -11,9 +11,8 @@ use chrono::Utc;
 use clap::{Args, Parser, Subcommand};
 use rust_decimal::Decimal;
 use sdu_infohelper::{
-    Event, Location, QueryError, SelectionLevel, aircon, alert_due, auth, clear_alert, history,
-    mark_alert, query, save_event, selection_options, settings, with_dorm_auth_overrides,
-    with_dorm_directory_auth_overrides,
+    Event, Location, SelectionLevel, aircon, alert_due, auth, clear_alert, history, mark_alert,
+    monitor, save_event, selection_options, settings, with_dorm_directory_auth_overrides,
 };
 
 #[derive(Parser)]
@@ -216,43 +215,15 @@ fn secure_history(_path: &std::path::Path) -> Result<(), String> {
     Ok(())
 }
 
-fn failure_flags(error: &QueryError) -> (bool, bool) {
-    let needs_login_attention =
-        matches!(error, QueryError::Authentication | QueryError::AuthFlow(_));
-    let fatal = needs_login_attention || matches!(error, QueryError::Config(_));
-    (fatal, needs_login_attention)
-}
-
 fn event(args: &QueryArgs) -> (Event, bool, bool) {
-    let mut target = None;
-    let result = with_dorm_auth_overrides(
+    let sample = monitor::query_once(
         &args.config,
         Duration::from_secs(args.timeout),
+        args.threshold,
         &args.location.overrides(),
-        |config, connection| {
-            if config.form.values().any(|value| value == "_") {
-                return Err(QueryError::Config(
-                    "请配置完整 dorm_electricity 目标，或使用 --campus --building --floor --room 指定。",
-                ));
-            }
-            let location = config.location()?;
-            target = Some(location.clone());
-            let reading = query(config, connection)?;
-            Ok(
-                Event::success(reading, args.threshold, config.expiry_claim())
-                    .at_location(location),
-            )
-        },
+        monitor::Comparison::Inclusive,
     );
-    match result {
-        Ok(event) => (event, false, false),
-        Err(error) => {
-            let (fatal, auth) = failure_flags(&error);
-            let mut failure = Event::failure(&error);
-            failure.location = target;
-            (failure, fatal, auth)
-        }
-    }
+    (sample.event, sample.fatal, sample.needs_login)
 }
 
 fn print_event(event: &Event, json: bool) {
@@ -540,20 +511,21 @@ fn main() -> ExitCode {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sdu_infohelper::QueryError;
 
     #[test]
     fn second_factor_requirement_stops_watch_and_requests_attention() {
         assert_eq!(
-            failure_flags(&QueryError::AuthFlow("需要二次验证")),
+            monitor::failure_flags(&QueryError::AuthFlow("需要二次验证")),
             (true, true)
         );
-        assert_eq!(failure_flags(&QueryError::Network), (false, false));
+        assert_eq!(monitor::failure_flags(&QueryError::Network), (false, false));
         for error in [
             QueryError::Http(408),
             QueryError::Http(429),
             QueryError::Response("刷新响应暂不可用"),
         ] {
-            assert_eq!(failure_flags(&error), (false, false));
+            assert_eq!(monitor::failure_flags(&error), (false, false));
         }
     }
 }

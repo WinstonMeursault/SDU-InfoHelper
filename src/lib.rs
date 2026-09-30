@@ -13,6 +13,7 @@ pub mod aircon;
 pub mod auth;
 mod cas;
 mod cas_des;
+pub mod monitor;
 pub mod notification;
 pub mod settings;
 
