@@ -15,6 +15,7 @@ use sdu_infohelper::{
     mark_alert, query, save_event, selection_options, settings, with_dorm_auth_overrides,
     with_dorm_directory_auth_overrides,
 };
+mod service_cli;
 
 #[derive(Parser)]
 #[command(version, about = "山大威海宿舍电费查询与本地监控")]
@@ -25,6 +26,8 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    /// 多用户服务、独立绑定和提醒队列（预留 NapCat 接入）
+    Service(service_cli::ServiceArgs),
     /// 统一身份认证、令牌导入和登录状态
     Auth {
         #[command(subcommand)]
@@ -302,6 +305,7 @@ fn alert(title: &str, message: &str, desktop: bool) -> bool {
 
 fn run(cli: Cli) -> Result<bool, String> {
     match cli.command {
+        Command::Service(args) => service_cli::run(args),
         Command::CheckConfig { config } => {
             settings::Settings::load(&config).map_err(|e| e.to_string())?;
             println!("YAML 配置结构有效；账号、设备授信和服务可用性需登录验证。");

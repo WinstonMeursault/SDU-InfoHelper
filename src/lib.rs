@@ -13,6 +13,7 @@ pub mod aircon;
 pub mod auth;
 mod cas;
 mod cas_des;
+pub mod service;
 pub mod settings;
 
 pub const ENDPOINT: &str = "https://mcard.sdu.edu.cn/charge/feeitem/getThirdData";
