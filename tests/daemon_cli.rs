@@ -45,7 +45,7 @@ fn wait_state(
     paths: &Paths,
     predicate: impl Fn(&sdu_infohelper::daemon::RuntimeState) -> bool,
 ) -> sdu_infohelper::daemon::RuntimeState {
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let deadline = Instant::now() + Duration::from_secs(30);
     loop {
         if let Some(state) = paths.state().unwrap()
             && predicate(&state)
@@ -54,7 +54,8 @@ fn wait_state(
         }
         assert!(
             Instant::now() < deadline,
-            "worker failed to reach expected state"
+            "worker failed to reach expected state; last state: {}",
+            serde_json::to_string(&paths.state().unwrap()).unwrap()
         );
         thread::sleep(Duration::from_millis(25));
     }

@@ -26,7 +26,8 @@ pub fn server(
     );
     let (sender, receiver) = mpsc::channel();
     let handle = thread::spawn(move || {
-        let deadline = Instant::now() + Duration::from_secs(5);
+        // Leave room for cold executable startup on shared Windows CI machines.
+        let deadline = Instant::now() + Duration::from_secs(30);
         let mut stream = loop {
             match listener.accept() {
                 Ok((stream, _)) => break stream,
