@@ -1,5 +1,8 @@
 # CLI 发布与部署
 
+当前版本为 `v1.1.0`，新增跨平台 daemon 与 PushDeer / Webhook 通知。
+配置保持向后兼容；升级内容与部署提示见 [更新记录](../CHANGELOG.md)。
+
 项目交付 CLI。GitHub Actions 在 Linux x86_64、Windows x86_64、macOS x86_64 和
 macOS arm64 上运行测试；推送与 `Cargo.toml` 版本一致的 `v*` tag 后，发布流程会
 构建四个 CLI 压缩包，先完成 GitHub Release，再将同一 Linux amd64/arm64 镜像
@@ -39,15 +42,15 @@ Linux 桌面；服务器上查询结果、错误和提醒可由服务管理器�
 
 Docker Hub 仓库名为 `winstonmeursault/sdu-infohelper`。Docker Hub 要求仓库名
 使用小写字母，所以镜像名不能写成 `SDU-InfoHelper`。以下示例使用 GHCR 镜像；
-也可将镜像地址换成 `winstonmeursault/sdu-infohelper:v1.0.0`。
+也可将镜像地址换成 `winstonmeursault/sdu-infohelper:v1.1.0`。
 
 ```bash
 docker run --rm --user "$(id -u):$(id -g)" \
-  -v "$PWD/data:/data" ghcr.io/winstonmeursault/sdu-infohelper:v1.0.0 check-config
+  -v "$PWD/data:/data" ghcr.io/winstonmeursault/sdu-infohelper:v1.1.0 check-config
 docker run --rm -it --user "$(id -u):$(id -g)" \
-  -v "$PWD/data:/data" ghcr.io/winstonmeursault/sdu-infohelper:v1.0.0 auth login --trust-device
+  -v "$PWD/data:/data" ghcr.io/winstonmeursault/sdu-infohelper:v1.1.0 auth login --trust-device
 docker run --rm --user "$(id -u):$(id -g)" \
-  -v "$PWD/data:/data" ghcr.io/winstonmeursault/sdu-infohelper:v1.0.0 query --json
+  -v "$PWD/data:/data" ghcr.io/winstonmeursault/sdu-infohelper:v1.1.0 query --json
 ```
 
 首次运行前在宿主机的 `data/config.yaml` 填好配置。自动生成的设备 ID 会写回
