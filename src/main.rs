@@ -74,6 +74,23 @@ enum Command {
 enum DaemonCommand {
     /// 前台运行；系统后台任务也调用此入口
     Run(daemon::RunOptions),
+    /// 注册当前用户后台任务；自启动需显式开启，不立即启动
+    Install {
+        #[arg(long)]
+        autostart: bool,
+    },
+    /// 启动已安装的后台任务
+    Start,
+    /// 停止后重新启动并读取配置
+    Restart {
+        #[arg(long, default_value_t = 30, value_parser = clap::value_parser!(u64).range(1..=300))]
+        wait_seconds: u64,
+    },
+    /// 停止并移除服务注册，保留配置、历史和日志
+    Uninstall {
+        #[arg(long, default_value_t = 30, value_parser = clap::value_parser!(u64).range(1..=300))]
+        wait_seconds: u64,
+    },
     /// 请求当前实例优雅停止
     Stop {
         #[arg(long, default_value_t = 30, value_parser = clap::value_parser!(u64).range(1..=300))]
@@ -302,78 +319,127 @@ fn alert(title: &str, message: &str, desktop: bool) -> bool {
 
 fn run(cli: Cli) -> Result<bool, String> {
     match cli.command {
-        Command::Daemon { config, command } => match command {
-            DaemonCommand::Run(options) => {
-                match daemon::run(&config, &options) {
-                    Ok(()) => Ok(true),
-                    Err(error) if options.managed => {
-                        // Known configuration/storage failures must not trigger manager restart loops.
-                        eprintln!("{error}");
-                        Ok(true)
+        Command::Daemon { config, command } => {
+            match command {
+                DaemonCommand::Install { autostart } => {
+                    let running = daemon::platform::install(&config, autostart)?;
+                    println!(
+                        "后台服务已安装；登录自启动：{}。",
+                        if autostart { "开启" } else { "关闭" }
+                    );
+                    if running {
+                        println!("现有实例仍在运行；新注册参数在 restart 后应用。");
+                    } else {
+                        println!("执行 daemon start 启动监控。");
                     }
-                    Err(error) => Err(error),
+                    Ok(true)
                 }
-            }
-            DaemonCommand::Stop { wait_seconds } => {
-                let paths = daemon::Paths::new(&config)?;
-                if !paths.request_stop()? {
-                    println!("监控未运行。");
-                } else if paths.wait_stopped(wait_seconds)? {
-                    println!("监控已正常停止。");
-                } else {
-                    return Err("监控未在等待时间内停止；当前网络操作仍受配置超时限制。".into());
+                DaemonCommand::Start => {
+                    daemon::platform::start(&config)?;
+                    println!("监控已运行。");
+                    Ok(true)
                 }
-                Ok(true)
-            }
-            DaemonCommand::Status { json } => {
-                let status = daemon::local_status(&config)?;
-                if json {
+                DaemonCommand::Restart { wait_seconds } => {
+                    daemon::platform::restart(&config, wait_seconds)?;
+                    println!("监控已重新启动。");
+                    Ok(true)
+                }
+                DaemonCommand::Uninstall { wait_seconds } => {
+                    daemon::platform::uninstall(&config, wait_seconds)?;
+                    println!("后台服务已卸载，配置、历史和日志保留。");
+                    Ok(true)
+                }
+                DaemonCommand::Run(options) => {
+                    match daemon::run(&config, &options) {
+                        Ok(()) => Ok(true),
+                        Err(error) if options.managed => {
+                            // Known configuration/storage failures must not trigger manager restart loops.
+                            eprintln!("{error}");
+                            Ok(true)
+                        }
+                        Err(error) => Err(error),
+                    }
+                }
+                DaemonCommand::Stop { wait_seconds } => {
+                    let result = daemon::platform::stop(&config, wait_seconds)?;
                     println!(
                         "{}",
-                        serde_json::to_string(&status).map_err(|_| "无法序列化监控状态。")?
-                    );
-                } else {
-                    println!(
-                        "监控：{}；数据目录：{}",
-                        if status.running {
-                            "运行中"
+                        if result.forced {
+                            "监控已由系统管理器终止。"
+                        } else if result.was_running {
+                            "监控已正常停止。"
                         } else {
-                            "未运行"
-                        },
-                        status.data_directory.display()
+                            "监控未运行。"
+                        }
                     );
-                    if let Some(runtime) = &status.runtime {
+                    Ok(true)
+                }
+                DaemonCommand::Status { json } => {
+                    let status = daemon::local_status(&config)?;
+                    if json {
                         println!(
-                            "状态：{}；最近查询：{}；下次检查：{}",
-                            runtime.status,
-                            runtime.last_attempt_at.as_deref().unwrap_or("尚无"),
-                            runtime.next_check_at.as_deref().unwrap_or("无")
+                            "{}",
+                            serde_json::to_string(&status).map_err(|_| "无法序列化监控状态。")?
                         );
-                        if let Some(reading) = &runtime.last_success {
+                    } else {
+                        println!(
+                            "监控：{}；数据目录：{}",
+                            if status.running {
+                                "运行中"
+                            } else {
+                                "未运行"
+                            },
+                            status.data_directory.display()
+                        );
+                        println!(
+                            "后台注册：{}；自启动：{}；管理器状态：{}",
+                            status.service.name.as_deref().unwrap_or("未安装"),
+                            match status.service.autostart {
+                                Some(true) => "开启",
+                                Some(false) => "关闭",
+                                None => "未知 / 未安装",
+                            },
+                            status.service.error.as_deref().unwrap_or(
+                                if status.service.registered {
+                                    "可用"
+                                } else {
+                                    "未注册"
+                                }
+                            )
+                        );
+                        if let Some(runtime) = &status.runtime {
                             println!(
-                                "最近成功读数：{} 度（{}）。",
-                                reading.remaining_kwh, reading.checked_at
+                                "状态：{}；最近查询：{}；下次检查：{}",
+                                runtime.status,
+                                runtime.last_attempt_at.as_deref().unwrap_or("尚无"),
+                                runtime.next_check_at.as_deref().unwrap_or("无")
                             );
-                        }
-                        if let Some(error) = &runtime.last_error {
-                            println!("最近错误：{error}");
-                        }
-                        for channel in &runtime.channels {
-                            println!(
-                                "渠道 {}：{}；最近错误：{}",
-                                channel.id,
-                                channel.status,
-                                channel.last_error.as_deref().unwrap_or("无")
-                            );
+                            if let Some(reading) = &runtime.last_success {
+                                println!(
+                                    "最近成功读数：{} 度（{}）。",
+                                    reading.remaining_kwh, reading.checked_at
+                                );
+                            }
+                            if let Some(error) = &runtime.last_error {
+                                println!("最近错误：{error}");
+                            }
+                            for channel in &runtime.channels {
+                                println!(
+                                    "渠道 {}：{}；最近错误：{}",
+                                    channel.id,
+                                    channel.status,
+                                    channel.last_error.as_deref().unwrap_or("无")
+                                );
+                            }
                         }
                     }
+                    Ok(true)
                 }
-                Ok(true)
+                DaemonCommand::TestNotification { channel } => {
+                    daemon::test_notification(&config, channel.as_deref())
+                }
             }
-            DaemonCommand::TestNotification { channel } => {
-                daemon::test_notification(&config, channel.as_deref())
-            }
-        },
+        }
         Command::CheckConfig { config } => {
             settings::Settings::load(&config).map_err(|e| e.to_string())?;
             println!("YAML 配置结构有效；账号、设备授信和服务可用性需登录验证。");

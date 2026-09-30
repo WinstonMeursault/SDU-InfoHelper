@@ -25,6 +25,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+pub mod platform;
 mod signals;
 
 #[derive(Args, Clone, Default)]
@@ -60,10 +61,11 @@ impl RunOptions {
         if let Some(value) = self.timeout {
             daemon.query_timeout_seconds = value;
         }
-        let history_override = self
-            .history
-            .clone()
-            .or_else(|| std::env::var_os("SDU_INFOHELPER_HISTORY").map(PathBuf::from));
+        let history_override = self.history.clone().or_else(|| {
+            (!self.managed)
+                .then(|| std::env::var_os("SDU_INFOHELPER_HISTORY").map(PathBuf::from))
+                .flatten()
+        });
         daemon.history = match history_override {
             Some(path) if path.is_absolute() => path,
             Some(path) => std::env::current_dir()
@@ -273,6 +275,9 @@ impl Paths {
             .map_err(|_| "无法读取实例标识。")?;
         Ok(text)
     }
+    pub(crate) fn owner_matches(&self, run_id: &str) -> Result<bool, String> {
+        Ok(self.owner()? == run_id)
+    }
     pub fn wait_stopped(&self, seconds: u64) -> Result<bool, String> {
         let deadline = Instant::now() + Duration::from_secs(seconds);
         while self.running()? {
@@ -298,6 +303,8 @@ pub struct LastSuccess {
 pub struct RuntimeState {
     pub run_id: String,
     pub pid: u32,
+    #[serde(default)]
+    pub executable: Option<PathBuf>,
     pub status: String,
     pub started_at: String,
     pub last_attempt_at: Option<String>,
@@ -391,6 +398,7 @@ pub fn run(config: &Path, options: &RunOptions) -> Result<(), String> {
     let mut state = RuntimeState {
         run_id,
         pid: std::process::id(),
+        executable: std::env::current_exe().ok(),
         status: "starting".into(),
         started_at: Utc::now().to_rfc3339(),
         last_attempt_at: None,
@@ -544,6 +552,7 @@ pub struct LocalStatus {
     pub running: bool,
     pub data_directory: PathBuf,
     pub runtime: Option<RuntimeState>,
+    pub service: platform::ServiceStatus,
 }
 
 pub fn local_status(config: &Path) -> Result<LocalStatus, String> {
@@ -567,6 +576,7 @@ pub fn local_status(config: &Path) -> Result<LocalStatus, String> {
         running,
         data_directory: paths.directory,
         runtime,
+        service: platform::status(config)?,
     })
 }
 
@@ -584,6 +594,7 @@ mod tests {
         let mut state = RuntimeState {
             run_id: "old".into(),
             pid: 999999,
+            executable: None,
             status: "healthy".into(),
             started_at: "old".into(),
             last_attempt_at: None,

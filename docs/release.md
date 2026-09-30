@@ -25,7 +25,8 @@ Windows 将程序名换为 `sdu-infohelper.exe`。CLI 默认使用当前工作�
 `--history` 或环境变量 `SDU_INFOHELPER_CONFIG`、`SDU_INFOHELPER_HISTORY`
 设置绝对路径。宿舍认证缓存默认相对配置文件存放。
 
-Linux 用户可用 `watch` 作为前台常驻进程，并交由自己的服务管理器启动；
+Linux、macOS 和 Windows 可使用 [daemon](daemon.md) 的 install / start 管理原生用户服务，
+通过 PushDeer 或 Webhook 提醒。旧 `watch` 也可作为前台常驻进程交由自己的服务管理器启动；
 仓库内的 `scripts/monitor.sh` 是可选的 systemd 用户服务包装器，不包含在
 独立二进制部署的必需步骤。`--notify-desktop` 仅适合装有 `notify-send` 的
 Linux 桌面；服务器上查询结果、错误和提醒可由服务管理器采集标准输出与错误。
@@ -51,7 +52,8 @@ docker run --rm --user "$(id -u):$(id -g)" \
 
 首次运行前在宿主机的 `data/config.yaml` 填好配置。自动生成的设备 ID 会写回
 该配置，因此登录时挂载目录需可写。后台运行可交给 Docker Compose、systemd
-或其他调度器；镜像本身执行一次 CLI 命令，不内置定时服务。
+或其他调度器；可将镜像命令设为 `daemon run` 启动常驻监控。
+容器内不执行 daemon install；实例状态和历史随 `/data` 挂载持久化。
 
 ## 打 tag 前
 
