@@ -1709,6 +1709,7 @@ dependencies = [
  "clap",
  "fs2",
  "hex",
+ "libc",
  "md-5",
  "rand 0.8.8",
  "regex",

@@ -26,3 +26,6 @@ serde_yaml = "0.9"
 scraper = "0.23"
 tempfile = "3"
 thiserror = "2"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"

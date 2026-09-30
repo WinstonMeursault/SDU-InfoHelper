@@ -5,7 +5,7 @@ use crate::{
     settings::NotificationSettings,
 };
 use rusqlite::{Connection, OptionalExtension, params};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 type Result<T> = std::result::Result<T, String>;
 const LOW: &str = "electricity.low_balance";
@@ -16,7 +16,7 @@ pub struct Channel {
     pub notifier: Box<dyn Notifier>,
 }
 
-#[derive(Clone, Serialize)]
+#[derive(Clone, Deserialize, Serialize)]
 pub struct ChannelState {
     pub id: String,
     pub status: String,

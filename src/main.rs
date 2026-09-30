@@ -11,8 +11,9 @@ use chrono::Utc;
 use clap::{Args, Parser, Subcommand};
 use rust_decimal::Decimal;
 use sdu_infohelper::{
-    Event, Location, SelectionLevel, aircon, alert_due, auth, clear_alert, history, mark_alert,
-    monitor, save_event, selection_options, settings, with_dorm_directory_auth_overrides,
+    Event, Location, SelectionLevel, aircon, alert_due, auth, clear_alert, daemon, history,
+    mark_alert, monitor, save_event, selection_options, settings,
+    with_dorm_directory_auth_overrides,
 };
 
 #[derive(Parser)]
@@ -51,6 +52,13 @@ enum Command {
     Query(QueryArgs),
     /// 定时查询、保存历史并提醒
     Watch(WatchArgs),
+    /// 跨平台常驻监控及通知渠道测试
+    Daemon {
+        #[arg(long, global = true, default_value_os_t = default_config())]
+        config: PathBuf,
+        #[command(subcommand)]
+        command: DaemonCommand,
+    },
     /// 列出校区、楼栋、楼层或房间，使用返回的参数值查询
     List(ListArgs),
     /// 查看近期查询记录
@@ -59,6 +67,27 @@ enum Command {
         history: PathBuf,
         #[arg(long, default_value_t = 20, value_parser = clap::value_parser!(u32).range(1..=1000))]
         limit: u32,
+    },
+}
+
+#[derive(Subcommand)]
+enum DaemonCommand {
+    /// 前台运行；系统后台任务也调用此入口
+    Run(daemon::RunOptions),
+    /// 请求当前实例优雅停止
+    Stop {
+        #[arg(long, default_value_t = 30, value_parser = clap::value_parser!(u64).range(1..=300))]
+        wait_seconds: u64,
+    },
+    /// 查看进程及最近查询和推送状态
+    Status {
+        #[arg(long)]
+        json: bool,
+    },
+    /// 显式发送测试消息，不影响预警冷却
+    TestNotification {
+        #[arg(long)]
+        channel: Option<String>,
     },
 }
 
@@ -273,6 +302,78 @@ fn alert(title: &str, message: &str, desktop: bool) -> bool {
 
 fn run(cli: Cli) -> Result<bool, String> {
     match cli.command {
+        Command::Daemon { config, command } => match command {
+            DaemonCommand::Run(options) => {
+                match daemon::run(&config, &options) {
+                    Ok(()) => Ok(true),
+                    Err(error) if options.managed => {
+                        // Known configuration/storage failures must not trigger manager restart loops.
+                        eprintln!("{error}");
+                        Ok(true)
+                    }
+                    Err(error) => Err(error),
+                }
+            }
+            DaemonCommand::Stop { wait_seconds } => {
+                let paths = daemon::Paths::new(&config)?;
+                if !paths.request_stop()? {
+                    println!("监控未运行。");
+                } else if paths.wait_stopped(wait_seconds)? {
+                    println!("监控已正常停止。");
+                } else {
+                    return Err("监控未在等待时间内停止；当前网络操作仍受配置超时限制。".into());
+                }
+                Ok(true)
+            }
+            DaemonCommand::Status { json } => {
+                let status = daemon::local_status(&config)?;
+                if json {
+                    println!(
+                        "{}",
+                        serde_json::to_string(&status).map_err(|_| "无法序列化监控状态。")?
+                    );
+                } else {
+                    println!(
+                        "监控：{}；数据目录：{}",
+                        if status.running {
+                            "运行中"
+                        } else {
+                            "未运行"
+                        },
+                        status.data_directory.display()
+                    );
+                    if let Some(runtime) = &status.runtime {
+                        println!(
+                            "状态：{}；最近查询：{}；下次检查：{}",
+                            runtime.status,
+                            runtime.last_attempt_at.as_deref().unwrap_or("尚无"),
+                            runtime.next_check_at.as_deref().unwrap_or("无")
+                        );
+                        if let Some(reading) = &runtime.last_success {
+                            println!(
+                                "最近成功读数：{} 度（{}）。",
+                                reading.remaining_kwh, reading.checked_at
+                            );
+                        }
+                        if let Some(error) = &runtime.last_error {
+                            println!("最近错误：{error}");
+                        }
+                        for channel in &runtime.channels {
+                            println!(
+                                "渠道 {}：{}；最近错误：{}",
+                                channel.id,
+                                channel.status,
+                                channel.last_error.as_deref().unwrap_or("无")
+                            );
+                        }
+                    }
+                }
+                Ok(true)
+            }
+            DaemonCommand::TestNotification { channel } => {
+                daemon::test_notification(&config, channel.as_deref())
+            }
+        },
         Command::CheckConfig { config } => {
             settings::Settings::load(&config).map_err(|e| e.to_string())?;
             println!("YAML 配置结构有效；账号、设备授信和服务可用性需登录验证。");

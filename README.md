@@ -90,6 +90,10 @@ bash scripts/electricity.sh query --json
 
 ## 监控和空调
 
+新增 daemon 的前台运行、状态、停止及 PushDeer / Webhook 配置见
+[常驻监控](docs/daemon.md)和[通知渠道](docs/notifications.md)。
+跨平台后台管理的实现范围与进度见 [daemon 设计](docs/daemon-design.md)。
+
 ```bash
 bash scripts/monitor.sh start --interval 21600 --threshold 10
 bash scripts/monitor.sh status
