@@ -4,7 +4,7 @@ use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use chrono::{DateTime, Utc};
 use regex::Regex;
 use reqwest::{StatusCode, blocking::Client, redirect::Policy};
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -22,9 +22,19 @@ pub const ENDPOINT: &str = "https://mcard.sdu.edu.cn/charge/feeitem/getThirdData
 pub fn with_dorm_auth<T>(
     path: &Path,
     timeout: Duration,
+    operation: impl FnMut(&Config, &Client) -> Result<T, QueryError>,
+) -> Result<T, QueryError> {
+    with_dorm_auth_overrides(path, timeout, &BTreeMap::new(), operation)
+}
+
+/// Merge a temporary target before resolving directory names or querying the server.
+pub fn with_dorm_auth_overrides<T>(
+    path: &Path,
+    timeout: Duration,
+    overrides: &BTreeMap<String, String>,
     mut operation: impl FnMut(&Config, &Client) -> Result<T, QueryError>,
 ) -> Result<T, QueryError> {
-    with_dorm_auth_depth(path, timeout, 4, &mut operation)
+    with_dorm_auth_depth(path, timeout, 4, overrides, &mut operation)
 }
 
 /// Directory lookups resolve only the ancestors required by this level.
@@ -32,22 +42,41 @@ pub fn with_dorm_directory_auth<T>(
     path: &Path,
     timeout: Duration,
     level: SelectionLevel,
+    operation: impl FnMut(&Config, &Client) -> Result<T, QueryError>,
+) -> Result<T, QueryError> {
+    with_dorm_directory_auth_overrides(path, timeout, level, &BTreeMap::new(), operation)
+}
+
+/// Merge directory ancestors before resolving them; unused descendants are ignored.
+pub fn with_dorm_directory_auth_overrides<T>(
+    path: &Path,
+    timeout: Duration,
+    level: SelectionLevel,
+    overrides: &BTreeMap<String, String>,
     mut operation: impl FnMut(&Config, &Client) -> Result<T, QueryError>,
 ) -> Result<T, QueryError> {
-    with_dorm_auth_depth(path, timeout, level.number(), &mut operation)
+    with_dorm_auth_depth(path, timeout, level.number(), overrides, &mut operation)
 }
 
 fn with_dorm_auth_depth<T>(
     path: &Path,
     timeout: Duration,
     depth: usize,
+    overrides: &BTreeMap<String, String>,
     operation: &mut impl FnMut(&Config, &Client) -> Result<T, QueryError>,
 ) -> Result<T, QueryError> {
     let client = client(timeout)?;
     if path.extension().is_some_and(|x| x == "json") {
-        return operation(&Config::load(path)?, &client);
+        let mut config = Config::load(path)?;
+        if depth == 4 {
+            config = config.with_location_overrides(overrides)?;
+        } else {
+            selection_form(&config, selection_level(depth), overrides)?;
+            config.form.extend(overrides.clone());
+        }
+        return operation(&config, &client);
     }
-    let settings = settings::Settings::load(path)?;
+    let settings = settings::Settings::load(path)?.with_dorm_overrides(overrides, depth)?;
     let token = auth::token(&settings, path, timeout, None)?;
     let attempt = settings
         .dorm_request_depth(&token.access_token, &client, depth)
@@ -58,6 +87,16 @@ fn with_dorm_auth_depth<T>(
     let token = auth::token(&settings, path, timeout, Some(&token.access_token))?;
     let request = settings.dorm_request_depth(&token.access_token, &client, depth)?;
     operation(&request, &client)
+}
+
+fn selection_level(depth: usize) -> SelectionLevel {
+    match depth {
+        0 => SelectionLevel::Campuses,
+        1 => SelectionLevel::Buildings,
+        2 => SelectionLevel::Floors,
+        3 => SelectionLevel::Rooms,
+        _ => unreachable!("directory depth"),
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -501,9 +540,12 @@ impl Event {
 }
 
 pub fn history(path: &Path) -> rusqlite::Result<Connection> {
-    let connection = Connection::open(path)?;
+    let mut connection = Connection::open(path)?;
     connection.busy_timeout(Duration::from_secs(5))?;
-    connection.execute_batch(
+    // Acquire the write lock before inspecting the schema so concurrent callers
+    // cannot both decide to add the same column.
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    transaction.execute_batch(
         "CREATE TABLE IF NOT EXISTS readings (
         id INTEGER PRIMARY KEY, checked_at TEXT NOT NULL,
         remaining_kwh TEXT, supply_status TEXT, threshold_kwh TEXT,
@@ -513,19 +555,20 @@ pub fn history(path: &Path) -> rusqlite::Result<Connection> {
     );",
     )?;
     let columns: Vec<String> = {
-        let mut statement = connection.prepare("PRAGMA table_info(readings)")?;
+        let mut statement = transaction.prepare("PRAGMA table_info(readings)")?;
         statement
             .query_map([], |row| row.get(1))?
             .collect::<Result<_, _>>()?
     };
     for column in ["campus", "building", "floor", "room"] {
         if !columns.iter().any(|existing| existing == column) {
-            connection.execute(
+            transaction.execute(
                 &format!("ALTER TABLE readings ADD COLUMN {column} TEXT"),
                 [],
             )?;
         }
     }
+    transaction.commit()?;
     Ok(connection)
 }
 
@@ -588,6 +631,79 @@ mod tests {
             "form": {"feeitemid":"411", "type":"IEC", "level":"4", "campus":"C1&Campus", "building":"B1&Building", "floor":"F1&Floor", "room":"R1&Room"},
             "headers": {"synjones-auth": "test-token"}
         })).unwrap()
+    }
+
+    #[test]
+    fn temporary_targets_are_merged_before_stale_defaults_are_resolved() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.yaml");
+        let original = b"dorm_electricity:\n  campus: C1&Campus\n  building: B1&Building\n  floor: removed-floor\n  room: removed-room\n";
+        auth::secure_write(&path, original).unwrap();
+        let settings = settings::Settings::load(&path).unwrap();
+        auth::secure_write(
+            &settings.cache_path(&path),
+            br#"{"access_token":"test","refresh_token":null,"expires_at":null,"client_authorization":null}"#,
+        )
+        .unwrap();
+        let overrides = BTreeMap::from([
+            ("floor".into(), "F2&Floor".into()),
+            ("room".into(), "R2&Room".into()),
+        ]);
+        with_dorm_auth_overrides(&path, Duration::from_secs(1), &overrides, |request, _| {
+            assert_eq!(request.form["floor"], "F2&Floor");
+            assert_eq!(request.form["room"], "R2&Room");
+            Ok(())
+        })
+        .unwrap();
+        let overrides = BTreeMap::from([("floor".into(), "F2&Floor".into())]);
+        with_dorm_directory_auth_overrides(
+            &path,
+            Duration::from_secs(1),
+            SelectionLevel::Rooms,
+            &overrides,
+            |request, _| {
+                assert_eq!(request.form["floor"], "F2&Floor");
+                assert_eq!(request.form["room"], "_");
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(fs::read(&path).unwrap(), original);
+    }
+
+    #[test]
+    fn legacy_requests_keep_query_and_directory_override_rules() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("request.json");
+        fs::write(&path, serde_json::to_vec(&config()).unwrap()).unwrap();
+        let overrides = BTreeMap::from([
+            ("building".into(), "B2&Building".into()),
+            ("floor".into(), "F2&Floor".into()),
+            ("room".into(), "R2&Room".into()),
+        ]);
+        with_dorm_auth_overrides(&path, Duration::from_secs(1), &overrides, |request, _| {
+            assert_eq!(request.form["building"], "B2&Building");
+            assert_eq!(request.form["room"], "R2&Room");
+            Ok(())
+        })
+        .unwrap();
+        let incomplete = BTreeMap::from([("building".into(), "B2&Building".into())]);
+        assert!(matches!(
+            with_dorm_auth_overrides(&path, Duration::from_secs(1), &incomplete, |_, _| Ok(())),
+            Err(QueryError::Config(_))
+        ));
+        with_dorm_directory_auth_overrides(
+            &path,
+            Duration::from_secs(1),
+            SelectionLevel::Floors,
+            &incomplete,
+            |request, _| {
+                let form = selection_form(request, SelectionLevel::Floors, &BTreeMap::new())?;
+                assert_eq!(form["building"], "B2&Building");
+                Ok(())
+            },
+        )
+        .unwrap();
     }
 
     #[test]
@@ -713,6 +829,58 @@ mod tests {
             rooms,
             vec![None, Some("R1&101".into()), Some("R2&202".into())]
         );
+    }
+
+    #[test]
+    fn concurrent_history_initialization_and_migration_preserve_all_writes() {
+        use std::{
+            sync::{Arc, Barrier},
+            thread,
+        };
+        let dir = tempfile::tempdir().unwrap();
+        for legacy in [false, true] {
+            for attempt in 0..4 {
+                let path = dir
+                    .path()
+                    .join(format!("history-{legacy}-{attempt}.sqlite3"));
+                if legacy {
+                    let connection = Connection::open(&path).unwrap();
+                    connection.execute_batch("CREATE TABLE readings (id INTEGER PRIMARY KEY, checked_at TEXT NOT NULL, remaining_kwh TEXT, supply_status TEXT, threshold_kwh TEXT, low_balance INTEGER, error TEXT); INSERT INTO readings (checked_at, remaining_kwh) VALUES ('legacy', '35.67');").unwrap();
+                }
+                let start = Arc::new(Barrier::new(8));
+                let workers: Vec<_> = (0..8)
+                    .map(|_| {
+                        let start = Arc::clone(&start);
+                        let path = path.clone();
+                        thread::spawn(move || -> rusqlite::Result<()> {
+                            start.wait();
+                            let connection = history(&path)?;
+                            save_event(
+                                &connection,
+                                &Event::failure(&QueryError::Network)
+                                    .at_location(config().location().unwrap()),
+                            )
+                        })
+                    })
+                    .collect();
+                for worker in workers {
+                    worker.join().unwrap().unwrap();
+                }
+                let connection = history(&path).unwrap();
+                let writes: u32 = connection.query_row("SELECT COUNT(*) FROM readings WHERE campus = 'C1&Campus' AND building = 'B1&Building' AND floor = 'F1&Floor' AND room = 'R1&Room'", [], |row| row.get(0)).unwrap();
+                assert_eq!(writes, 8);
+                if legacy {
+                    let value: String = connection
+                        .query_row(
+                            "SELECT remaining_kwh FROM readings WHERE checked_at = 'legacy'",
+                            [],
+                            |row| row.get(0),
+                        )
+                        .unwrap();
+                    assert_eq!(value, "35.67");
+                }
+            }
+        }
     }
 
     #[test]

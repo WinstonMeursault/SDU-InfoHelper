@@ -1,0 +1,150 @@
+name: Release CLI
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - name: Match tag to package version
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import os
+          import tomllib
+          with open('Cargo.toml', 'rb') as file:
+              version = tomllib.load(file)['package']['version']
+          assert os.environ['GITHUB_REF_NAME'] == 'v' + version, 'Tag must match Cargo.toml version'
+          PY
+      - name: Check Docker Hub publishing credentials
+        env:
+          DOCKERHUB_USERNAME: ${{ vars.DOCKERHUB_USERNAME }}
+          DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+        shell: bash
+        run: |
+          test -n "$DOCKERHUB_USERNAME" || { echo 'Set the DOCKERHUB_USERNAME repository variable.' >&2; exit 1; }
+          test -n "$DOCKERHUB_TOKEN" || { echo 'Set the DOCKERHUB_TOKEN repository secret.' >&2; exit 1; }
+      - name: Verify Docker Hub login
+        uses: docker/login-action@v4
+        with:
+          username: ${{ vars.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+  binaries:
+    needs: validate
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-22.04
+            triple: x86_64-unknown-linux-gnu
+            executable: sdu-infohelper
+            archive: tar.gz
+          - os: windows-2025
+            triple: x86_64-pc-windows-msvc
+            executable: sdu-infohelper.exe
+            archive: zip
+          - os: macos-15-intel
+            triple: x86_64-apple-darwin
+            executable: sdu-infohelper
+            archive: tar.gz
+          - os: macos-15
+            triple: aarch64-apple-darwin
+            executable: sdu-infohelper
+            archive: tar.gz
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+      - name: Prepare Rust toolchain
+        run: rustup toolchain install stable --profile minimal
+      - name: Test CLI
+        run: cargo +stable test --locked
+      - name: Build release binary
+        run: cargo +stable build --release --locked
+      - name: Package CLI
+        shell: bash
+        run: |
+          package="sdu-infohelper-${GITHUB_REF_NAME}-${{ matrix.triple }}"
+          mkdir -p "dist/$package"
+          cp "target/release/${{ matrix.executable }}" README.md LICENSE config.example.yaml "dist/$package/"
+          cp -R docs "dist/$package/"
+          "dist/$package/${{ matrix.executable }}" --version
+          if [[ '${{ matrix.archive }}' == 'zip' ]]; then
+            python3 - "$package" <<'PY'
+          import pathlib, sys, zipfile
+          package = sys.argv[1]
+          root = pathlib.Path('dist', package)
+          with zipfile.ZipFile(f'dist/{package}.zip', 'w', zipfile.ZIP_DEFLATED) as archive:
+              for path in root.rglob('*'):
+                  if path.is_file():
+                      archive.write(path, path.relative_to(root.parent))
+          PY
+          else
+            tar -C dist -czf "dist/$package.tar.gz" "$package"
+          fi
+      - uses: actions/upload-artifact@v7
+        with:
+          name: sdu-infohelper-${{ matrix.triple }}
+          path: dist/*.${{ matrix.archive }}
+          if-no-files-found: error
+
+  github_release:
+    needs: binaries
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: sdu-infohelper-*
+          merge-multiple: true
+          path: dist
+      - name: Publish release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          if gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "$GITHUB_REF_NAME" dist/* --repo "$GITHUB_REPOSITORY" --clobber
+          else
+            gh release create "$GITHUB_REF_NAME" dist/* --repo "$GITHUB_REPOSITORY" --verify-tag --generate-notes
+          fi
+
+  docker:
+    needs: github_release
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v7
+      - uses: docker/setup-qemu-action@v4
+      - uses: docker/setup-buildx-action@v4
+      - uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: docker/login-action@v4
+        with:
+          username: ${{ vars.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+      - name: Set image name
+        id: image
+        shell: bash
+        run: echo "name=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_OUTPUT"
+      - uses: docker/build-push-action@v7
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: |
+            ${{ steps.image.outputs.name }}:${{ github.ref_name }}
+            ${{ vars.DOCKERHUB_USERNAME }}/sdu-infohelper:${{ github.ref_name }}

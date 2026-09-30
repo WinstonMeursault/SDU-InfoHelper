@@ -6,7 +6,7 @@ cas:
 auth:
   cache: .local/electricity/auth.json # 相对于 config.yaml，自动以 600 权限保存
 
-# 空调用电，使用母仓库的独立查询服务。
+# 空调用电，使用独立于宿舍普通用电的查询服务。
 aircon:
   building: null
   floor: null # 不填写时从房间号推断，例如 405 -> 4 层

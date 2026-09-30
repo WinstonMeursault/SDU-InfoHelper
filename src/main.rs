@@ -12,8 +12,8 @@ use clap::{Args, Parser, Subcommand};
 use rust_decimal::Decimal;
 use sdu_infohelper::{
     Event, Location, QueryError, SelectionLevel, aircon, alert_due, auth, clear_alert, history,
-    mark_alert, query, save_event, selection_options, settings, with_dorm_auth,
-    with_dorm_directory_auth,
+    mark_alert, query, save_event, selection_options, settings, with_dorm_auth_overrides,
+    with_dorm_directory_auth_overrides,
 };
 
 #[derive(Parser)]
@@ -187,10 +187,14 @@ struct WatchArgs {
 }
 
 fn default_config() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("config.yaml")
+    std::env::var_os("SDU_INFOHELPER_CONFIG")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("config.yaml"))
 }
 fn default_history() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(".local/electricity/history.sqlite3")
+    std::env::var_os("SDU_INFOHELPER_HISTORY")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(".local/electricity/history.sqlite3"))
 }
 
 fn ensure_parent(path: &std::path::Path) -> Result<(), String> {
@@ -200,23 +204,32 @@ fn ensure_parent(path: &std::path::Path) -> Result<(), String> {
     Ok(())
 }
 
+#[cfg(unix)]
 fn secure_history(path: &std::path::Path) -> Result<(), String> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(path, fs::Permissions::from_mode(0o600))
-            .map_err(|_| "无法设置历史文件权限。".to_owned())?;
-    }
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(path, fs::Permissions::from_mode(0o600))
+        .map_err(|_| "无法设置历史文件权限。".to_owned())
+}
+
+#[cfg(not(unix))]
+fn secure_history(_path: &std::path::Path) -> Result<(), String> {
     Ok(())
+}
+
+fn failure_flags(error: &QueryError) -> (bool, bool) {
+    let needs_login_attention =
+        matches!(error, QueryError::Authentication | QueryError::AuthFlow(_));
+    let fatal = needs_login_attention || matches!(error, QueryError::Config(_));
+    (fatal, needs_login_attention)
 }
 
 fn event(args: &QueryArgs) -> (Event, bool, bool) {
     let mut target = None;
-    let result = with_dorm_auth(
+    let result = with_dorm_auth_overrides(
         &args.config,
         Duration::from_secs(args.timeout),
+        &args.location.overrides(),
         |config, connection| {
-            let config = config.with_location_overrides(&args.location.overrides())?;
             if config.form.values().any(|value| value == "_") {
                 return Err(QueryError::Config(
                     "请配置完整 dorm_electricity 目标，或使用 --campus --building --floor --room 指定。",
@@ -224,7 +237,7 @@ fn event(args: &QueryArgs) -> (Event, bool, bool) {
             }
             let location = config.location()?;
             target = Some(location.clone());
-            let reading = query(&config, connection)?;
+            let reading = query(config, connection)?;
             Ok(
                 Event::success(reading, args.threshold, config.expiry_claim())
                     .at_location(location),
@@ -234,8 +247,7 @@ fn event(args: &QueryArgs) -> (Event, bool, bool) {
     match result {
         Ok(event) => (event, false, false),
         Err(error) => {
-            let auth = matches!(error, QueryError::Authentication);
-            let fatal = auth || matches!(error, QueryError::Config(_) | QueryError::AuthFlow(_));
+            let (fatal, auth) = failure_flags(&error);
             let mut failure = Event::failure(&error);
             failure.location = target;
             (failure, fatal, auth)
@@ -365,11 +377,14 @@ fn run(cli: Cli) -> Result<bool, String> {
             .into_iter()
             .filter_map(|(key, value)| value.map(|value| (key.to_owned(), value)))
             .collect();
-            let options = with_dorm_directory_auth(
+            let options = with_dorm_directory_auth_overrides(
                 &args.config,
                 Duration::from_secs(args.timeout),
                 args.level,
-                |config, connection| selection_options(config, connection, args.level, &overrides),
+                &overrides,
+                |config, connection| {
+                    selection_options(config, connection, args.level, &BTreeMap::new())
+                },
             )
             .map_err(|error| error.to_string())?;
             if args.json {
@@ -518,6 +533,27 @@ fn main() -> ExitCode {
         Err(error) => {
             eprintln!("{error}");
             ExitCode::FAILURE
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn second_factor_requirement_stops_watch_and_requests_attention() {
+        assert_eq!(
+            failure_flags(&QueryError::AuthFlow("需要二次验证")),
+            (true, true)
+        );
+        assert_eq!(failure_flags(&QueryError::Network), (false, false));
+        for error in [
+            QueryError::Http(408),
+            QueryError::Http(429),
+            QueryError::Response("刷新响应暂不可用"),
+        ] {
+            assert_eq!(failure_flags(&error), (false, false));
         }
     }
 }
