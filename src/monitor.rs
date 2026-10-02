@@ -1,9 +1,8 @@
 //! Shared single-query logic and channel-independent monitor state.
 use crate::{
-    Event, QueryError,
-    control::{OperationControl, OperationError},
-    dorm::with_dorm_auth_controlled,
-    query,
+    Event, Location, QueryError,
+    control::OperationControl,
+    source::{DormSource, ElectricitySource, ReadContext, SourceError},
 };
 use rust_decimal::Decimal;
 use std::{
@@ -76,28 +75,58 @@ pub(crate) fn observe_once_controlled(
     overrides: &BTreeMap<String, String>,
     comparison: Comparison,
 ) -> Option<Observation> {
-    let mut target = None;
-    let result = with_dorm_auth_controlled(path, control, overrides, |config, connection| {
-        if config.form.values().any(|value| value == "_") {
-            return Err(QueryError::Config(
-                "请配置完整 dorm_electricity 目标，或使用 --campus --building --floor --room 指定。",
-            ));
-        }
-        let location = config.location()?;
-        target = Some(location.clone());
-        let reading = query(config, connection)?;
-        Ok(Observation::success(
-            reading,
-            location,
+    observe_source(
+        &DormSource::new(path, overrides),
+        &ReadContext::from_control(control),
+        threshold,
+        comparison,
+    )
+}
+
+/// Sample a resolved dorm-shaped source using the existing event and threshold contract.
+pub fn query_source<S: ElectricitySource<Target = Location> + ?Sized>(
+    source: &S,
+    timeout: Duration,
+    threshold: Option<Decimal>,
+    comparison: Comparison,
+) -> Sample {
+    query_source_with_context(source, &ReadContext::new(timeout), threshold, comparison)
+        .unwrap_or_else(|| {
+            Observation::failure(QueryError::Response("查询已取消。"), None).into_sample()
+        })
+}
+
+/// Cancelled operations produce no sample, history entry or notification.
+pub fn query_source_with_context<S: ElectricitySource<Target = Location> + ?Sized>(
+    source: &S,
+    context: &ReadContext<'_>,
+    threshold: Option<Decimal>,
+    comparison: Comparison,
+) -> Option<Sample> {
+    observe_source(source, context, threshold, comparison).map(Observation::into_sample)
+}
+
+fn observe_source<S: ElectricitySource<Target = Location> + ?Sized>(
+    source: &S,
+    context: &ReadContext<'_>,
+    threshold: Option<Decimal>,
+    comparison: Comparison,
+) -> Option<Observation> {
+    let result = context.check().and_then(|()| source.read(context));
+    let result = match context.check() {
+        Ok(()) => result,
+        Err(error) => Err(error),
+    };
+    Some(match result {
+        Ok(value) => Observation::success(
+            value.reading,
+            value.target,
             threshold,
             comparison,
-            config.expiry_claim(),
-        ))
-    });
-    Some(match result {
-        Ok(observation) => observation,
-        Err(OperationError::Cancelled) => return None,
-        Err(OperationError::Query(error)) => Observation::failure(error, target),
+            value.token_expires_at_claim,
+        ),
+        Err(SourceError::Cancelled) => return None,
+        Err(SourceError::Failed { error, target }) => Observation::failure(error, target),
     })
 }
 

@@ -217,3 +217,7 @@ fn main() -> Result<(), QueryError> {
 `settings::Settings::load` 保留全量读取和校验行为；`Settings::read` 仅读取配置结构，供调用方执行相应功能的校验，`Settings::validate` 可显式执行全量校验。原有根模块导出的查询、类型和历史函数仍可按原路径调用。
 
 历史调用也可使用 `storage::HistoryStore::open`、`record` 和 `recent`，返回记录保持原有十进制字符串、可空电量及宿舍位置。原有 `history`、`save_event` 和提醒冷却函数继续可用；历史表与旧数据库迁移保持兼容。
+
+来源扩展可实现 `source::ElectricitySource`，关联类型 `Target` 表示该服务的目标；`SourceReading` 保留 `Reading` 中的 `Decimal`，失败的 `SourceError` 可携带已解析目标。`DormSource` 和 `AirconSource` 已使用此接口。`ReadContext` 控制请求超时和合作式取消，来源应在操作之间检查取消；已开始的请求不会被强制中断。
+
+`monitor::query_source` 将 `Target = Location` 的来源转换为原有 `Sample`；需要取消时使用 `query_source_with_context`，取消返回 `None`。这使替代宿舍查询来源可复用现有事件与阈值策略；空调目标仍有独立类型，当前没有空调后台监控功能。

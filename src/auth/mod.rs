@@ -225,16 +225,24 @@ pub fn aircon_session(
     timeout: Duration,
     options: LoginOptions,
 ) -> Result<(Client, crate::settings::AirconTarget), QueryError> {
+    aircon_session_controlled(path, &OperationControl::uninterrupted(timeout), options)
+        .map_err(OperationError::into_query)
+}
+
+pub(crate) fn aircon_session_controlled(
+    path: &Path,
+    control: &OperationControl<'_>,
+    options: LoginOptions,
+) -> Result<(Client, crate::settings::AirconTarget), OperationError> {
+    control.check()?;
     let settings = Settings::read(path)?;
     settings.aircon.selected()?;
-    let _lock = lock(
-        &settings.cache_path(path),
-        &OperationControl::uninterrupted(timeout),
-    )
-    .map_err(OperationError::into_query)?;
+    let _lock = lock(&settings.cache_path(path), control)?;
+    control.check()?;
     let credentials = credentials(path)?;
-    let client = cas::client(timeout)?;
+    let client = cas::client(control.timeout)?;
     cas::login(&client, cas::AIRCON_ENTRY, &credentials, options)?;
+    control.check()?;
     Ok((client, settings.aircon))
 }
 

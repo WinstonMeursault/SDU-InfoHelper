@@ -1,8 +1,11 @@
 //! The upstream air-conditioning meter is a separate HTML service.
 use crate::{
-    QueryError,
-    auth::{self, LoginOptions},
+    QueryError, Reading,
+    auth::LoginOptions,
     settings::AirconTarget,
+    source::{
+        AirconLocation, AirconSource, ElectricitySource, ReadContext, SourceError, SourceReading,
+    },
 };
 use reqwest::{Url, blocking::Client};
 use rust_decimal::Decimal;
@@ -19,6 +22,10 @@ pub struct AirconReading {
 }
 
 pub fn parse_reading(page: &str) -> Result<AirconReading, QueryError> {
+    parse_meter(page).map(AirconReading::from)
+}
+
+pub(crate) fn parse_meter(page: &str) -> Result<SourceReading<AirconLocation>, QueryError> {
     let document = Html::parse_document(page);
     let rows = Selector::parse("tr").unwrap();
     let cells = Selector::parse("td").unwrap();
@@ -48,15 +55,39 @@ pub fn parse_reading(page: &str) -> Result<AirconReading, QueryError> {
     };
     let remaining = Decimal::from_str(field("剩余电量")?)
         .map_err(|_| QueryError::Response("空调剩余电量不是有效数字。"))?;
-    Ok(AirconReading {
-        building: number("公寓")?,
-        floor: number("楼层")?,
-        room: number("房间")?,
-        remaining_kwh: remaining.to_string(),
+    Ok(SourceReading {
+        target: AirconLocation {
+            building: number("公寓")?,
+            floor: number("楼层")?,
+            room: number("房间")?,
+        },
+        reading: Reading {
+            remaining_kwh: remaining,
+            supply_status: None,
+        },
+        token_expires_at_claim: None,
     })
 }
 
+impl From<SourceReading<AirconLocation>> for AirconReading {
+    fn from(value: SourceReading<AirconLocation>) -> Self {
+        Self {
+            building: value.target.building,
+            floor: value.target.floor,
+            room: value.target.room,
+            remaining_kwh: value.reading.remaining_kwh.to_string(),
+        }
+    }
+}
+
 pub fn query(client: &Client, target: AirconTarget) -> Result<AirconReading, QueryError> {
+    query_meter(client, target).map(AirconReading::from)
+}
+
+pub(crate) fn query_meter(
+    client: &Client,
+    target: AirconTarget,
+) -> Result<SourceReading<AirconLocation>, QueryError> {
     let (building, floor, room) = target.selected()?;
     let mut url = Url::parse("https://gyktgd.wh.sdu.edu.cn/dianbiao/chongzhi.jsp").unwrap();
     url.query_pairs_mut()
@@ -76,8 +107,13 @@ pub fn query(client: &Client, target: AirconTarget) -> Result<AirconReading, Que
     if !response.status().is_success() {
         return Err(QueryError::Http(response.status().as_u16()));
     }
-    let reading = parse_reading(&response.text().map_err(|_| QueryError::Network)?)?;
-    if (reading.building, reading.floor, reading.room) != (building, floor, room) {
+    let reading = parse_meter(&response.text().map_err(|_| QueryError::Network)?)?;
+    if (
+        reading.target.building,
+        reading.target.floor,
+        reading.target.room,
+    ) != (building, floor, room)
+    {
         return Err(QueryError::Response(
             "空调页面的公寓、楼层或房间与请求不一致。",
         ));
@@ -89,8 +125,10 @@ pub fn query_config(
     timeout: Duration,
     options: LoginOptions,
 ) -> Result<AirconReading, QueryError> {
-    let (client, target) = auth::aircon_session(path, timeout, options)?;
-    query(&client, target)
+    AirconSource::new(path, options)
+        .read(&ReadContext::new(timeout))
+        .map(AirconReading::from)
+        .map_err(SourceError::into_query)
 }
 
 #[cfg(test)]
@@ -102,6 +140,12 @@ mod tests {
         let reading = parse_reading(html).unwrap();
         assert_eq!((reading.building, reading.floor, reading.room), (3, 4, 405));
         assert_eq!(reading.remaining_kwh, "7.01");
+        let precise = parse_meter(&html.replace("7.01", "7.0100")).unwrap();
+        assert_eq!(precise.reading.remaining_kwh.scale(), 4);
+        assert_eq!(
+            serde_json::to_string(&AirconReading::from(precise)).unwrap(),
+            r#"{"building":3,"floor":4,"room":405,"remaining_kwh":"7.0100"}"#
+        );
         assert!(parse_reading(&html.replace("7.01", "NaN")).is_err());
     }
 }

@@ -22,6 +22,7 @@ impl OperationError {
     }
 }
 
+#[derive(Clone, Copy)]
 pub(crate) struct OperationControl<'a> {
     pub timeout: Duration,
     cancelled: &'a dyn Fn() -> Result<bool, QueryError>,

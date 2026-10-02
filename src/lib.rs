@@ -13,6 +13,7 @@ mod local;
 pub mod monitor;
 pub mod notification;
 pub mod settings;
+pub mod source;
 pub mod storage;
 
 pub use domain::{Location, Reading};
