@@ -215,3 +215,5 @@ fn main() -> Result<(), QueryError> {
 `selection_options` 可查询宿舍目录，`aircon::query_config` 查询空调，`auth` 模块负责登录、缓存、状态和导入。认证缓存使用跨进程锁和原子写入；具体学校请求不属于稳定的对外 API，请勿在调用方硬编码学校内部 URL。
 
 `settings::Settings::load` 保留全量读取和校验行为；`Settings::read` 仅读取配置结构，供调用方执行相应功能的校验，`Settings::validate` 可显式执行全量校验。原有根模块导出的查询、类型和历史函数仍可按原路径调用。
+
+历史调用也可使用 `storage::HistoryStore::open`、`record` 和 `recent`，返回记录保持原有十进制字符串、可空电量及宿舍位置。原有 `history`、`save_event` 和提醒冷却函数继续可用；历史表与旧数据库迁移保持兼容。
