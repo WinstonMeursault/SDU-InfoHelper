@@ -1,11 +1,12 @@
 //! Synchronous worker orchestration and graceful cancellation.
 use super::{
-    LastSuccess, Log, Paths, RunOptions, RuntimeState,
+    Log, Paths, RunOptions,
     instance::{private_directory, random_id},
     signals,
+    state::{WorkerState, WorkerStatus},
 };
 use crate::{
-    QueryError,
+    Event, QueryError,
     control::OperationControl,
     monitor::{
         self, Comparison, Schedule,
@@ -21,10 +22,6 @@ use std::{
     thread,
     time::{Duration, Instant},
 };
-
-fn timestamp(value: i64) -> Option<String> {
-    chrono::DateTime::from_timestamp(value, 0).map(|date| date.to_rfc3339())
-}
 
 fn secure_history(path: &Path) -> Result<(), String> {
     #[cfg(unix)]
@@ -58,25 +55,18 @@ pub fn run(config: &Path, options: &RunOptions) -> Result<(), String> {
     } else {
         starts.clear();
     }
-    let mut state = RuntimeState {
+    let mut state = WorkerState::new(
         run_id,
-        pid: std::process::id(),
-        executable: std::env::current_exe().ok(),
-        status: "starting".into(),
-        started_at: Utc::now().to_rfc3339(),
-        last_attempt_at: None,
-        last_success: previous.and_then(|state| state.last_success),
-        next_check_at: None,
-        last_error: None,
-        channels: Vec::new(),
-        recent_starts: starts,
-    };
+        Utc::now(),
+        previous.and_then(|state| state.last_success),
+        starts,
+    );
     let result = (|| {
         if options.managed && state.recent_starts.len() >= 3 {
             return Err("监控短时间反复启动，已停止自动重启；请检查日志后重新 start。".into());
         }
         state.recent_starts.push(now);
-        paths.save(&state)?;
+        paths.save(&state.snapshot())?;
         log.write("监控启动。")?;
         let settings = Settings::read(&paths.config).map_err(|e| e.to_string())?;
         let daemon = options.resolve(&settings, &paths.config)?;
@@ -102,9 +92,9 @@ pub fn run(config: &Path, options: &RunOptions) -> Result<(), String> {
             let now = Utc::now().timestamp();
             if schedule.due(Instant::now(), now) {
                 schedule.started(Instant::now(), now);
-                state.status = "checking".into();
-                state.next_check_at = timestamp(schedule.next_wall());
-                paths.save(&state)?;
+                state.status = WorkerStatus::Checking;
+                state.next_check_at = chrono::DateTime::from_timestamp(schedule.next_wall(), 0);
+                paths.save(&state.snapshot())?;
                 let cancelled = || {
                     if signals::requested() {
                         return Ok(true);
@@ -117,7 +107,7 @@ pub fn run(config: &Path, options: &RunOptions) -> Result<(), String> {
                     Duration::from_secs(daemon.query_timeout_seconds),
                     &cancelled,
                 );
-                let Some(sample) = monitor::query_once_controlled(
+                let Some(observation) = monitor::observe_once_controlled(
                     &paths.config,
                     &control,
                     Some(daemon.threshold_kwh),
@@ -129,43 +119,21 @@ pub fn run(config: &Path, options: &RunOptions) -> Result<(), String> {
                 if signals::requested() || paths.stop_requested(&state.run_id)? {
                     break;
                 }
+                let event = Event::from(&observation);
                 history
-                    .record(&sample.event)
+                    .record(&event)
                     .map_err(|_| "无法保存监控查询记录。")?;
-                state.last_attempt_at = Some(sample.event.checked_at.clone());
-                state.last_error.clone_from(&sample.event.error);
-                if sample.event.error.is_none() {
-                    state.last_success = Some(LastSuccess {
-                        checked_at: sample.event.checked_at.clone(),
-                        remaining_kwh: sample.event.remaining_kwh.clone().unwrap_or_default(),
-                        location: sample.event.location.clone(),
-                        supply_status: sample.event.supply_status.clone(),
-                    });
-                }
-                state.status = if sample.needs_login {
-                    "needs_login"
-                } else if sample.event.error.is_some() {
-                    "query_failed"
-                } else if sample.event.low_balance == Some(true) {
-                    "low_balance"
-                } else {
-                    "healthy"
-                }
-                .into();
-                let message = sample.event.error.clone().unwrap_or_else(|| {
-                    format!(
-                        "剩余电量 {} 度。",
-                        sample.event.remaining_kwh.as_deref().unwrap_or("未知")
-                    )
-                });
+                state.observe(&observation);
+                let message = observation.message();
                 log.write(&message)?;
                 if !options.managed {
-                    println!("[{0}] {message}", sample.event.checked_at);
+                    println!("[{0}] {message}", event.checked_at);
                 }
-                engine.observe(&sample.event, sample.needs_login, Utc::now().timestamp())?;
+                engine.observe_observation(&observation, Utc::now().timestamp())?;
                 state.channels = engine.states()?;
-                paths.save(&state)?;
-                if sample.fatal && !sample.needs_login {
+                paths.save(&state.snapshot())?;
+                let (fatal, needs_login) = observation.flags();
+                if fatal && !needs_login {
                     return Err(message);
                 }
                 continue;
@@ -185,19 +153,15 @@ pub fn run(config: &Path, options: &RunOptions) -> Result<(), String> {
                     println!("{message}");
                 }
                 state.channels = engine.states()?;
-                paths.save(&state)?;
+                paths.save(&state.snapshot())?;
                 continue;
             }
             thread::sleep(Duration::from_millis(250));
         }
         Ok(())
     })();
-    state.status = if result.is_ok() { "stopped" } else { "failed" }.into();
-    state.next_check_at = None;
-    if let Err(error) = &result {
-        state.last_error = Some(error.clone());
-    }
-    paths.save(&state)?;
+    state.finish(&result);
+    paths.save(&state.snapshot())?;
     log.write(if result.is_ok() {
         "监控已停止。"
     } else {

@@ -1,4 +1,5 @@
 //! Stable query output shared by CLI, history and notifications.
+use crate::monitor::observation::{Observation, Outcome};
 use crate::{Location, QueryError, Reading};
 use chrono::Utc;
 use rust_decimal::Decimal;
@@ -15,6 +16,37 @@ pub struct Event {
     pub token_expires_at_claim: Option<String>,
     pub error: Option<String>,
     pub location: Option<Location>,
+}
+
+impl From<&Observation> for Event {
+    fn from(observation: &Observation) -> Self {
+        match &observation.outcome {
+            Outcome::Success(success) => Self {
+                checked_at: observation.checked_at.to_rfc3339(),
+                remaining_kwh: Some(success.reading.remaining_kwh.to_string()),
+                unit: "kWh",
+                supply_status: success.reading.supply_status.clone(),
+                threshold_kwh: success.threshold.map(|value| value.to_string()),
+                low_balance: success.low_balance(),
+                token_expires_at_claim: success.expiry.clone(),
+                error: None,
+                location: Some(success.location.clone()),
+            },
+            Outcome::Failure {
+                error, location, ..
+            } => Self {
+                checked_at: observation.checked_at.to_rfc3339(),
+                remaining_kwh: None,
+                unit: "kWh",
+                supply_status: None,
+                threshold_kwh: None,
+                low_balance: None,
+                token_expires_at_claim: None,
+                error: Some(error.to_string()),
+                location: location.clone(),
+            },
+        }
+    }
 }
 
 impl Event {

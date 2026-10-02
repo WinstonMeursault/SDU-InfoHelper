@@ -1,5 +1,5 @@
 //! Merge instance files with native service status without mutating either.
-use super::{Paths, RuntimeState, platform};
+use super::{Paths, RuntimeState, platform, state::WorkerStatus};
 use serde::Serialize;
 use std::path::{Path, PathBuf};
 
@@ -24,7 +24,7 @@ pub fn local_status(config: &Path) -> Result<LocalStatus, String> {
     }
     if let (false, Some(state)) = (running, &mut runtime) {
         if !matches!(state.status.as_str(), "stopped" | "failed") {
-            state.status = "terminated".into();
+            state.status = WorkerStatus::Terminated.as_str().into();
         }
         state.next_check_at = None;
     }

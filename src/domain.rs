@@ -25,8 +25,40 @@ impl Location {
     }
 }
 
-#[derive(Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct Reading {
     pub remaining_kwh: Decimal,
     pub supply_status: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum DeliveryStatus {
+    Pending,
+    Accepted,
+    Blocked,
+    Exhausted,
+    Cancelled,
+}
+
+impl DeliveryStatus {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::Accepted => "accepted",
+            Self::Blocked => "blocked",
+            Self::Exhausted => "exhausted",
+            Self::Cancelled => "cancelled",
+        }
+    }
+
+    pub(crate) fn parse(value: &str) -> Option<Self> {
+        match value {
+            "pending" => Some(Self::Pending),
+            "accepted" => Some(Self::Accepted),
+            "blocked" => Some(Self::Blocked),
+            "exhausted" => Some(Self::Exhausted),
+            "cancelled" => Some(Self::Cancelled),
+            _ => None,
+        }
+    }
 }

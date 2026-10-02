@@ -13,6 +13,8 @@ use std::{
 };
 
 pub mod delivery;
+pub(crate) mod observation;
+use observation::{FailureDisposition, Observation};
 
 #[derive(Clone, Copy)]
 pub enum Comparison {
@@ -36,11 +38,7 @@ pub struct Sample {
 }
 
 pub fn failure_flags(error: &QueryError) -> (bool, bool) {
-    let needs_login = matches!(error, QueryError::Authentication | QueryError::AuthFlow(_));
-    (
-        needs_login || matches!(error, QueryError::Config(_)),
-        needs_login,
-    )
+    FailureDisposition::of(error).flags()
 }
 
 pub fn query_once(
@@ -67,6 +65,17 @@ pub(crate) fn query_once_controlled(
     overrides: &BTreeMap<String, String>,
     comparison: Comparison,
 ) -> Option<Sample> {
+    observe_once_controlled(path, control, threshold, overrides, comparison)
+        .map(Observation::into_sample)
+}
+
+pub(crate) fn observe_once_controlled(
+    path: &Path,
+    control: &OperationControl<'_>,
+    threshold: Option<Decimal>,
+    overrides: &BTreeMap<String, String>,
+    comparison: Comparison,
+) -> Option<Observation> {
     let mut target = None;
     let result = with_dorm_auth_controlled(path, control, overrides, |config, connection| {
         if config.form.values().any(|value| value == "_") {
@@ -77,29 +86,18 @@ pub(crate) fn query_once_controlled(
         let location = config.location()?;
         target = Some(location.clone());
         let reading = query(config, connection)?;
-        let low = threshold.map(|value| comparison.low(reading.remaining_kwh, value));
-        let mut event =
-            Event::success(reading, threshold, config.expiry_claim()).at_location(location);
-        event.low_balance = low;
-        Ok(event)
+        Ok(Observation::success(
+            reading,
+            location,
+            threshold,
+            comparison,
+            config.expiry_claim(),
+        ))
     });
     Some(match result {
-        Ok(event) => Sample {
-            event,
-            fatal: false,
-            needs_login: false,
-        },
+        Ok(observation) => observation,
         Err(OperationError::Cancelled) => return None,
-        Err(OperationError::Query(error)) => {
-            let (fatal, needs_login) = failure_flags(&error);
-            let mut event = Event::failure(&error);
-            event.location = target;
-            Sample {
-                event,
-                fatal,
-                needs_login,
-            }
-        }
+        Err(OperationError::Query(error)) => Observation::failure(error, target),
     })
 }
 

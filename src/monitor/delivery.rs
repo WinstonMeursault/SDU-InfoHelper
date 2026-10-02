@@ -1,6 +1,8 @@
 //! Durable per-channel cooldown and retry budgets. No network call holds a DB transaction.
 use crate::{
     Event,
+    domain::DeliveryStatus,
+    monitor::observation::{FailureDisposition, Observation, Outcome},
     notification::{Alert, HttpNotifier, Notifier},
     settings::NotificationSettings,
     storage::{
@@ -34,6 +36,14 @@ pub struct DeliveryReport {
     pub channel: String,
     pub accepted: bool,
     pub error: Option<String>,
+}
+
+enum Notice {
+    LowBalance(Alert, String),
+    Recovered,
+    NoThreshold,
+    AuthRequired(Alert, String),
+    Failed,
 }
 
 pub struct DeliveryEngine<'a> {
@@ -114,27 +124,88 @@ impl<'a> DeliveryEngine<'a> {
             .expect("alert topic serialization")
     }
 
-    /// Called after every query, including failures, before any retry is dispatched.
+    /// Compatibility adapter for callers that already supply the stable Event DTO.
     pub fn observe(&mut self, event: &Event, needs_login: bool, now: i64) -> Result<()> {
+        let notice = if event.error.is_none() {
+            match event.low_balance {
+                Some(true) => {
+                    let alert = Alert::low_balance(event);
+                    let topic = Self::topic(&alert);
+                    Notice::LowBalance(alert, topic)
+                }
+                Some(false) => Notice::Recovered,
+                None => Notice::NoThreshold,
+            }
+        } else if needs_login {
+            let alert = Alert::auth_required(event.location.clone());
+            let topic = Self::topic(&alert);
+            Notice::AuthRequired(alert, topic)
+        } else {
+            Notice::Failed
+        };
+        self.observe_notice(notice, now)
+    }
+
+    pub(crate) fn observe_observation(
+        &mut self,
+        observation: &Observation,
+        now: i64,
+    ) -> Result<()> {
+        let notice = match &observation.outcome {
+            Outcome::Success(success) => match success.low_balance() {
+                Some(true) => {
+                    let alert = Alert::low_balance(&Event::from(observation));
+                    let topic = serde_json::to_string(&(
+                        LOW,
+                        Some(&success.location),
+                        success.threshold.map(|value| value.normalize().to_string()),
+                    ))
+                    .expect("alert topic serialization");
+                    Notice::LowBalance(alert, topic)
+                }
+                Some(false) => Notice::Recovered,
+                None => Notice::NoThreshold,
+            },
+            Outcome::Failure {
+                location,
+                disposition: FailureDisposition::NeedsLogin,
+                ..
+            } => {
+                let alert = Alert::auth_required(location.clone());
+                let topic = Self::topic(&alert);
+                Notice::AuthRequired(alert, topic)
+            }
+            Outcome::Failure { .. } => Notice::Failed,
+        };
+        self.observe_notice(notice, now)
+    }
+
+    fn observe_notice(&mut self, notice: Notice, now: i64) -> Result<()> {
         self.active_topic = None;
-        if event.error.is_none() {
-            db(self.store.clear_kind(AUTH))?;
-            if event.low_balance == Some(true) {
-                self.enqueue(&Alert::low_balance(event), now)?;
-            } else if event.low_balance == Some(false) {
+        match notice {
+            Notice::LowBalance(alert, topic) => {
+                db(self.store.clear_kind(AUTH))?;
+                self.enqueue(topic, &alert, now)?;
+            }
+            Notice::Recovered => {
+                db(self.store.clear_kind(AUTH))?;
                 db(self.store.clear_kind(LOW))?;
             }
-        } else {
-            db(self.store.cancel_pending())?;
-            if needs_login {
-                self.enqueue(&Alert::auth_required(event.location.clone()), now)?;
+            Notice::NoThreshold => {
+                db(self.store.clear_kind(AUTH))?;
+            }
+            Notice::AuthRequired(alert, topic) => {
+                db(self.store.cancel_pending())?;
+                self.enqueue(topic, &alert, now)?;
+            }
+            Notice::Failed => {
+                db(self.store.cancel_pending())?;
             }
         }
         Ok(())
     }
 
-    fn enqueue(&mut self, alert: &Alert, now: i64) -> Result<()> {
-        let topic = Self::topic(alert);
+    fn enqueue(&mut self, topic: String, alert: &Alert, now: i64) -> Result<()> {
         self.active_topic = Some(topic.clone());
         for channel in &self.channels {
             if !db(self.store.due(&topic, &channel.id, now, self.repeat_after))? {
@@ -143,9 +214,9 @@ impl<'a> DeliveryEngine<'a> {
             let previous = db(self.store.stored(&topic, &channel.id))?;
             let mut payload = alert.clone();
             let (attempts, next_attempt, round_started) = match previous {
-                Some(previous) if previous.status == "blocked" => continue,
+                Some(previous) if previous.status == DeliveryStatus::Blocked => continue,
                 Some(previous)
-                    if previous.status != "accepted"
+                    if previous.status != DeliveryStatus::Accepted
                         && (previous.attempts < 3
                             || now.saturating_sub(previous.round_started)
                                 < self.interval as i64) =>
@@ -192,7 +263,7 @@ impl<'a> DeliveryEngine<'a> {
             let Some(stored) = db(self.store.stored(&topic, &channel.id))? else {
                 continue;
             };
-            if stored.status != "pending"
+            if stored.status != DeliveryStatus::Pending
                 || stored.attempts >= 3
                 || stored.next_attempt.is_none_or(|time| time > now)
             {
@@ -211,7 +282,11 @@ impl<'a> DeliveryEngine<'a> {
                 Attempt {
                     attempts,
                     next_attempt: next,
-                    status: if attempts < 3 { "pending" } else { "exhausted" },
+                    status: if attempts < 3 {
+                        DeliveryStatus::Pending
+                    } else {
+                        DeliveryStatus::Exhausted
+                    },
                     now,
                 },
             ))?;
@@ -227,13 +302,13 @@ impl<'a> DeliveryEngine<'a> {
                 }
                 Err(error) => {
                     let status = if !error.retryable {
-                        "blocked"
+                        DeliveryStatus::Blocked
                     } else if attempts >= 3 {
-                        "exhausted"
+                        DeliveryStatus::Exhausted
                     } else {
-                        "pending"
+                        DeliveryStatus::Pending
                     };
-                    let next = (status == "pending").then(|| {
+                    let next = (status == DeliveryStatus::Pending).then(|| {
                         now.saturating_add(
                             error
                                 .retry_after_seconds
@@ -264,7 +339,7 @@ impl<'a> DeliveryEngine<'a> {
                 Ok(match db(self.store.latest(&channel.id))? {
                     Some(state) => ChannelState {
                         id: channel.id.clone(),
-                        status: state.status,
+                        status: state.status.as_str().into(),
                         attempts: state.attempts,
                         next_attempt_at: state.next_attempt_at,
                         last_error: state.last_error,
@@ -281,5 +356,139 @@ impl<'a> DeliveryEngine<'a> {
                 })
             })
             .collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        Location, QueryError, Reading,
+        monitor::Comparison,
+        notification::{DeliveryReceipt, NotifyError},
+    };
+    use std::{cell::RefCell, rc::Rc};
+
+    #[derive(Clone)]
+    struct Fake(Rc<RefCell<Vec<Alert>>>);
+
+    impl Notifier for Fake {
+        fn send(&self, alert: &Alert) -> std::result::Result<DeliveryReceipt, NotifyError> {
+            let mut sent = self.0.borrow_mut();
+            sent.push(alert.clone());
+            if sent.len() == 1 {
+                Err(NotifyError {
+                    message: "暂时失败".into(),
+                    retryable: true,
+                    retry_after_seconds: None,
+                })
+            } else {
+                Ok(DeliveryReceipt)
+            }
+        }
+    }
+
+    fn reading(value: &str) -> Observation {
+        Observation::success(
+            Reading {
+                remaining_kwh: value.parse().unwrap(),
+                supply_status: None,
+            },
+            Location {
+                campus: "C".into(),
+                building: "B".into(),
+                floor: "F".into(),
+                room: "R".into(),
+            },
+            Some("10.00".parse().unwrap()),
+            Comparison::StrictlyBelow,
+            None,
+        )
+    }
+
+    #[test]
+    fn typed_and_legacy_event_paths_produce_equivalent_cooldowns_retries_and_payloads() {
+        let dir = tempfile::tempdir().unwrap();
+        let typed_history = HistoryStore::open(&dir.path().join("typed.sqlite3")).unwrap();
+        let legacy_history = HistoryStore::open(&dir.path().join("legacy.sqlite3")).unwrap();
+        let typed_sender = Fake(Rc::new(RefCell::new(Vec::new())));
+        let legacy_sender = Fake(Rc::new(RefCell::new(Vec::new())));
+        let mut typed = DeliveryEngine::for_history(
+            &typed_history,
+            "instance",
+            vec![Channel {
+                id: "test".into(),
+                notifier: Box::new(typed_sender.clone()),
+            }],
+            120,
+            60,
+        )
+        .unwrap();
+        let mut legacy = DeliveryEngine::for_history(
+            &legacy_history,
+            "instance",
+            vec![Channel {
+                id: "test".into(),
+                notifier: Box::new(legacy_sender.clone()),
+            }],
+            120,
+            60,
+        )
+        .unwrap();
+        for (now, observation) in [
+            (100, reading("9.50")),
+            (102, reading("8.25")),
+            (105, reading("7.000")),
+            (106, Observation::failure(QueryError::Network, None)),
+            (107, Observation::failure(QueryError::Authentication, None)),
+            (108, reading("10.00")),
+            (109, reading("1.00")),
+        ] {
+            typed.observe_observation(&observation, now).unwrap();
+            legacy
+                .observe(&Event::from(&observation), observation.flags().1, now)
+                .unwrap();
+            let typed_report = typed
+                .dispatch_next(now)
+                .unwrap()
+                .map(|report| (report.channel, report.accepted, report.error));
+            let legacy_report = legacy
+                .dispatch_next(now)
+                .unwrap()
+                .map(|report| (report.channel, report.accepted, report.error));
+            assert_eq!(typed_report, legacy_report);
+            assert_eq!(
+                serde_json::to_value(typed.states().unwrap()).unwrap(),
+                serde_json::to_value(legacy.states().unwrap()).unwrap()
+            );
+        }
+        for sender in [&typed_sender, &legacy_sender] {
+            let sent = sender.0.borrow();
+            assert_eq!(sent.len(), 4);
+            assert_eq!(
+                sent[0].event_id, sent[1].event_id,
+                "pending event identity must survive a fresh query"
+            );
+            assert_eq!(sent[2].event, AUTH);
+            assert!(sent[2].remaining_kwh.is_none());
+            assert_ne!(
+                sent[1].event_id, sent[3].event_id,
+                "recovery rearms a new logical event"
+            );
+        }
+        let payloads = |sender: &Fake| {
+            sender
+                .0
+                .borrow()
+                .iter()
+                .map(|alert| {
+                    let mut payload = serde_json::to_value(alert).unwrap();
+                    payload.as_object_mut().unwrap().remove("event_id");
+                    payload.as_object_mut().unwrap().remove("checked_at");
+                    payload
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(payloads(&typed_sender), payloads(&legacy_sender));
     }
 }

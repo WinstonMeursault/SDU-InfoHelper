@@ -1,10 +1,29 @@
 //! Durable delivery records and transactions; no notification or retry policy lives here.
+use crate::domain::DeliveryStatus;
+use rusqlite::types::{FromSql, FromSqlError, FromSqlResult, ToSql, ToSqlOutput, ValueRef};
 use rusqlite::{Connection, OptionalExtension, params};
+
+impl FromSql for DeliveryStatus {
+    fn column_result(value: ValueRef<'_>) -> FromSqlResult<Self> {
+        Self::parse(value.as_str()?).ok_or_else(|| {
+            FromSqlError::Other(Box::new(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "Unsupported delivery status",
+            )))
+        })
+    }
+}
+
+impl ToSql for DeliveryStatus {
+    fn to_sql(&self) -> rusqlite::Result<ToSqlOutput<'_>> {
+        Ok(self.as_str().into())
+    }
+}
 
 pub(crate) struct Stored {
     pub payload: String,
     pub attempts: u32,
-    pub status: String,
+    pub status: DeliveryStatus,
     pub next_attempt: Option<i64>,
     pub round_started: i64,
 }
@@ -21,12 +40,12 @@ pub(crate) struct Pending<'a> {
 pub(crate) struct Attempt {
     pub attempts: u32,
     pub next_attempt: Option<i64>,
-    pub status: &'static str,
+    pub status: DeliveryStatus,
     pub now: i64,
 }
 
 pub(crate) struct Latest {
-    pub status: String,
+    pub status: DeliveryStatus,
     pub attempts: u32,
     pub next_attempt_at: Option<i64>,
     pub last_error: Option<String>,
@@ -165,7 +184,7 @@ impl<'a> DeliveryStore<'a> {
         &self,
         topic: &str,
         channel: &str,
-        status: &str,
+        status: DeliveryStatus,
         next: Option<i64>,
         error: &str,
     ) -> rusqlite::Result<()> {
@@ -212,5 +231,29 @@ impl<'a> DeliveryStore<'a> {
             }
             None => Ok(None),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sqlite_statuses_keep_their_old_spelling_and_reject_unsupported_values() {
+        let connection = Connection::open_in_memory().unwrap();
+        for value in ["pending", "accepted", "blocked", "exhausted", "cancelled"] {
+            let status: DeliveryStatus = connection
+                .query_row("SELECT ?1", [value], |row| row.get(0))
+                .unwrap();
+            let written: String = connection
+                .query_row("SELECT ?1", [status], |row| row.get(0))
+                .unwrap();
+            assert_eq!(written, value);
+        }
+        let result = connection.query_row("SELECT ?1", ["unsupported-secret-value"], |row| {
+            row.get::<_, DeliveryStatus>(0)
+        });
+        let error = result.unwrap_err();
+        assert!(!error.to_string().contains("unsupported-secret-value"));
     }
 }
