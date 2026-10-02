@@ -1,5 +1,10 @@
 //! Shared single-query logic and channel-independent monitor state.
-use crate::{Event, QueryError, query, with_dorm_auth_overrides};
+use crate::{
+    Event, QueryError,
+    control::{OperationControl, OperationError},
+    dorm::with_dorm_auth_controlled,
+    query,
+};
 use rust_decimal::Decimal;
 use std::{
     collections::BTreeMap,
@@ -45,8 +50,25 @@ pub fn query_once(
     overrides: &BTreeMap<String, String>,
     comparison: Comparison,
 ) -> Sample {
+    query_once_controlled(
+        path,
+        &OperationControl::uninterrupted(timeout),
+        threshold,
+        overrides,
+        comparison,
+    )
+    .expect("an uninterrupted query cannot be cancelled")
+}
+
+pub(crate) fn query_once_controlled(
+    path: &Path,
+    control: &OperationControl<'_>,
+    threshold: Option<Decimal>,
+    overrides: &BTreeMap<String, String>,
+    comparison: Comparison,
+) -> Option<Sample> {
     let mut target = None;
-    let result = with_dorm_auth_overrides(path, timeout, overrides, |config, connection| {
+    let result = with_dorm_auth_controlled(path, control, overrides, |config, connection| {
         if config.form.values().any(|value| value == "_") {
             return Err(QueryError::Config(
                 "请配置完整 dorm_electricity 目标，或使用 --campus --building --floor --room 指定。",
@@ -61,13 +83,14 @@ pub fn query_once(
         event.low_balance = low;
         Ok(event)
     });
-    match result {
+    Some(match result {
         Ok(event) => Sample {
             event,
             fatal: false,
             needs_login: false,
         },
-        Err(error) => {
+        Err(OperationError::Cancelled) => return None,
+        Err(OperationError::Query(error)) => {
             let (fatal, needs_login) = failure_flags(&error);
             let mut event = Event::failure(&error);
             event.location = target;
@@ -77,7 +100,7 @@ pub fn query_once(
                 needs_login,
             }
         }
-    }
+    })
 }
 
 /// Single-thread schedule: skip missed intervals, and also detect sleep on clocks

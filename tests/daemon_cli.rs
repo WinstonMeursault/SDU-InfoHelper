@@ -213,6 +213,43 @@ fn status_is_read_only_and_failed_start_releases_lock_with_visible_error() {
     assert_eq!(paths.state().unwrap().unwrap().status, "failed");
 }
 
+#[test]
+fn stop_interrupts_authentication_lock_wait_without_waiting_for_the_lock_owner() {
+    use fs2::FileExt;
+    let dir = tempfile::tempdir().unwrap();
+    let config = configure(dir.path(), "http://127.0.0.1:1/test");
+    let paths = Paths::new(&config).unwrap();
+    let cache = dir.path().join(".local/electricity");
+    fs::create_dir_all(&cache).unwrap();
+    let lock = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(cache.join("auth.lock"))
+        .unwrap();
+    FileExt::lock_exclusive(&lock).unwrap();
+    let mut worker = start(&config, dir.path());
+    wait_state(&paths, |state| state.status == "checking");
+    let stopped = cli(&config)
+        .args(["stop", "--wait-seconds", "5"])
+        .output()
+        .unwrap();
+    assert!(stopped.status.success(), "{stopped:?}");
+    // The authentication owner still holds its lock when the worker exits.
+    finish(&mut worker);
+    assert_eq!(paths.state().unwrap().unwrap().status, "stopped");
+    let connection = rusqlite::Connection::open(cache.join("history.sqlite3")).unwrap();
+    let count: u32 = connection
+        .query_row("SELECT COUNT(*) FROM readings", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(
+        count, 0,
+        "cancellation must not create a failed reading or an authentication alert"
+    );
+    drop(lock);
+}
+
 #[cfg(unix)]
 #[test]
 fn sigterm_exits_cleanly_and_releases_instance_lock() {

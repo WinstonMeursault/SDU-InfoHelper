@@ -81,6 +81,8 @@
 
 相对 `auth.cache` 路径以配置文件目录为基准；daemon 的 YAML 历史路径也以配置文件目录为基准。配置中的秘密只保存在本机。
 
+`check-config` 校验所有配置段。认证和普通查询只校验其所用功能的配置，不会因通知 URL 或监控阈值的语义错误而被阻断；`daemon run` 校验最终监控参数及通知渠道，`daemon test-notification` 校验通知渠道。所有命令仍要求 YAML 字段结构有效。
+
 ## 通知 Webhook
 
 启用 Webhook 后，程序向配置的 URL 发送 POST JSON。请求固定包含：
@@ -134,6 +136,8 @@ Daemon 监控 `dorm_electricity` 中的一间宿舍，启动时立即查询，�
 状态和日志保存在配置目录下 `.local/electricity/daemon/<instance-id>/`，包括运行锁、状态文件、停止请求和有界日志。查询失败时 status 可以展示最近成功读数，但该旧读数不会参与本次预警判断。休眠或关机期间不查询，恢复后最多立即查询一次。
 
 后台认证会复用已有 Token 刷新和免交互 CAS 回退，不发送短信、不读取终端输入。需要二次验证时进入 `needs_login`，完成 `auth login --trust-device` 后下一周期恢复。
+
+认证缓存锁的等待期限与查询 `--timeout` 一致；等待超时作为暂时查询失败处理，不删除缓存、不触发登录失效提醒。后台等待锁时可以响应停止请求，取消的查询不生成历史记录或通知。已经开始的 HTTP 请求仍受其网络超时限制，`--timeout` 不表示整段多步认证流程的总时长。无超时参数的 `auth import` 最多等待认证锁 30 秒。
 
 ### 已实现的生命周期约定
 
@@ -209,3 +213,5 @@ fn main() -> Result<(), QueryError> {
 ```
 
 `selection_options` 可查询宿舍目录，`aircon::query_config` 查询空调，`auth` 模块负责登录、缓存、状态和导入。认证缓存使用跨进程锁和原子写入；具体学校请求不属于稳定的对外 API，请勿在调用方硬编码学校内部 URL。
+
+`settings::Settings::load` 保留全量读取和校验行为；`Settings::read` 仅读取配置结构，供调用方执行相应功能的校验，`Settings::validate` 可显式执行全量校验。原有根模块导出的查询、类型和历史函数仍可按原路径调用。

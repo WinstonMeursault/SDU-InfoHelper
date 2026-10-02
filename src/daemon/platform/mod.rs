@@ -4,7 +4,7 @@ mod command;
 mod render;
 
 use super::{Paths, RunOptions};
-use crate::{auth, settings::Settings};
+use crate::{local, settings::Settings};
 use command::{Runner, SystemRunner};
 use fs2::FileExt;
 use serde::{Deserialize, Serialize};
@@ -112,7 +112,7 @@ fn registration(
     autostart: bool,
     runner: &dyn Runner,
 ) -> Result<Registration, String> {
-    let settings = Settings::load(&paths.config).map_err(|e| e.to_string())?;
+    let settings = Settings::read(&paths.config).map_err(|e| e.to_string())?;
     settings
         .notifications
         .require_enabled()
@@ -196,18 +196,18 @@ pub fn install(config: &Path, autostart: bool) -> Result<bool, String> {
     let reg = registration(&paths, autostart, &runner)?;
     backend::available(&reg, &runner)?;
     let old_bytes = fs::read(&reg.definition).ok();
-    auth::secure_write(&reg.definition, &render::definition(&reg))
+    local::secure_write(&reg.definition, &render::definition(&reg))
         .map_err(|_| "无法保存后台服务定义。")?;
     if let Err(error) = backend::install(&reg, &runner) {
         if let Some(bytes) = old_bytes {
-            let _ = auth::secure_write(&reg.definition, &bytes);
+            let _ = local::secure_write(&reg.definition, &bytes);
         } else {
             let _ = backend::remove(&reg.definition);
         }
         return Err(error);
     }
     let bytes = serde_json::to_vec_pretty(&reg).map_err(|_| "无法序列化服务注册信息。")?;
-    auth::secure_write(&paths.file("service.json"), &bytes)
+    local::secure_write(&paths.file("service.json"), &bytes)
         .map_err(|_| "服务已注册，但本地注册信息保存失败；请重新 install。")?;
     if let Some(previous) = previous
         && previous.definition != reg.definition

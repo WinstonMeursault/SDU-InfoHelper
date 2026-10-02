@@ -1,6 +1,8 @@
 //! Portable worker and local lifecycle. Platform service adapters are a separate layer.
 use crate::{
-    Location, auth, history,
+    Location, QueryError,
+    control::OperationControl,
+    history, local,
     monitor::{
         self, Comparison, Schedule,
         delivery::{self, ChannelState, DeliveryEngine},
@@ -81,7 +83,6 @@ impl RunOptions {
         Ok(daemon)
     }
 }
-
 #[derive(Clone)]
 pub struct Paths {
     pub config: PathBuf,
@@ -193,7 +194,7 @@ impl Paths {
         })?;
         // Windows byte-range locks prevent another handle from reading the locked
         // file. Publish identity separately while retaining the exclusive lifetime lock.
-        auth::secure_write(&self.file("run.owner"), run_id.as_bytes())
+        local::secure_write(&self.file("run.owner"), run_id.as_bytes())
             .map_err(|_| "无法发布监控实例标识。")?;
         Ok(InstanceLock {
             run_id,
@@ -235,7 +236,7 @@ impl Paths {
     }
     fn save(&self, state: &RuntimeState) -> Result<(), String> {
         let bytes = serde_json::to_vec_pretty(state).map_err(|_| "无法序列化监控状态。")?;
-        auth::secure_write(&self.file("status.json"), &bytes)
+        local::secure_write(&self.file("status.json"), &bytes)
             .map_err(|_| "无法保存监控状态。".into())
     }
     fn stop_requested(&self, run_id: &str) -> Result<bool, String> {
@@ -259,7 +260,7 @@ impl Paths {
             if let Some(state) = self.state()?
                 && state.run_id == owner
             {
-                auth::secure_write(&self.file("stop.request"), owner.as_bytes())
+                local::secure_write(&self.file("stop.request"), owner.as_bytes())
                     .map_err(|_| "无法保存停止请求。")?;
                 return Ok(true);
             }
@@ -295,7 +296,6 @@ impl Paths {
         Ok(true)
     }
 }
-
 #[derive(Clone, Deserialize, Serialize)]
 pub struct LastSuccess {
     pub checked_at: String,
@@ -320,7 +320,6 @@ pub struct RuntimeState {
     #[serde(default)]
     pub recent_starts: Vec<i64>,
 }
-
 pub struct Log {
     paths: Paths,
     max_bytes: u64,
@@ -363,7 +362,6 @@ impl Log {
             .map_err(|_| "无法写入监控日志。".into())
     }
 }
-
 fn timestamp(value: i64) -> Option<String> {
     chrono::DateTime::from_timestamp(value, 0).map(|date| date.to_rfc3339())
 }
@@ -420,7 +418,7 @@ pub fn run(config: &Path, options: &RunOptions) -> Result<(), String> {
         state.recent_starts.push(now);
         paths.save(&state)?;
         log.write("监控启动。")?;
-        let settings = Settings::load(&paths.config).map_err(|e| e.to_string())?;
+        let settings = Settings::read(&paths.config).map_err(|e| e.to_string())?;
         let daemon = options.resolve(&settings, &paths.config)?;
         let channels = delivery::channels(&settings.notifications)?;
         if let Some(parent) = daemon.history.parent() {
@@ -446,13 +444,30 @@ pub fn run(config: &Path, options: &RunOptions) -> Result<(), String> {
                 state.status = "checking".into();
                 state.next_check_at = timestamp(schedule.next_wall());
                 paths.save(&state)?;
-                let sample = monitor::query_once(
-                    &paths.config,
+                let cancelled = || {
+                    if signals::requested() {
+                        return Ok(true);
+                    }
+                    paths
+                        .stop_requested(&state.run_id)
+                        .map_err(|_| QueryError::Config("无法读取停止请求。"))
+                };
+                let control = OperationControl::new(
                     Duration::from_secs(daemon.query_timeout_seconds),
+                    &cancelled,
+                );
+                let Some(sample) = monitor::query_once_controlled(
+                    &paths.config,
+                    &control,
                     Some(daemon.threshold_kwh),
                     &BTreeMap::new(),
                     Comparison::StrictlyBelow,
-                );
+                ) else {
+                    break;
+                };
+                if signals::requested() || paths.stop_requested(&state.run_id)? {
+                    break;
+                }
                 save_event(&connection, &sample.event).map_err(|_| "无法保存监控查询记录。")?;
                 state.last_attempt_at = Some(sample.event.checked_at.clone());
                 state.last_error.clone_from(&sample.event.error);
@@ -527,9 +542,8 @@ pub fn run(config: &Path, options: &RunOptions) -> Result<(), String> {
     })?;
     result
 }
-
 pub fn test_notification(config: &Path, selected: Option<&str>) -> Result<bool, String> {
-    let settings = Settings::load(config).map_err(|e| e.to_string())?;
+    let settings = Settings::read(config).map_err(|e| e.to_string())?;
     let channels = delivery::channels(&settings.notifications)?;
     if selected.is_some_and(|id| !channels.iter().any(|channel| channel.id == id)) {
         return Err("找不到指定的启用通知渠道。".into());
@@ -550,7 +564,6 @@ pub fn test_notification(config: &Path, selected: Option<&str>) -> Result<bool, 
     }
     Ok(success)
 }
-
 #[derive(Serialize)]
 pub struct LocalStatus {
     pub instance: String,
@@ -588,7 +601,6 @@ pub fn local_status(config: &Path) -> Result<LocalStatus, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
     #[test]
     fn stop_waits_for_new_state_and_status_never_reports_stale_live_pid() {
         let dir = tempfile::tempdir().unwrap();
