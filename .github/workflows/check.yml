@@ -34,6 +34,19 @@ jobs:
       - name: Test native user service lifecycle
         run: cargo +stable test --locked --test daemon_native -- --ignored --nocapture
 
+  msrv:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-22.04, windows-2025, macos-15-intel, macos-15]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+      - name: Prepare minimum Rust toolchain
+        run: rustup toolchain install 1.88.0 --profile minimal
+      - name: Test with declared minimum Rust version
+        run: cargo +1.88.0 test --locked
+
   docker:
     runs-on: ubuntu-24.04
     steps:
