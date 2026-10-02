@@ -5,13 +5,11 @@ use crate::{
     source::{DormSource, ElectricitySource, ReadContext, SourceError},
 };
 use rust_decimal::Decimal;
-use std::{
-    collections::BTreeMap,
-    path::Path,
-    time::{Duration, Instant},
-};
+use std::{collections::BTreeMap, path::Path, time::Duration};
 
 pub mod delivery;
+mod schedule;
+pub use schedule::{Cadence, Schedule};
 pub(crate) mod observation;
 use observation::{FailureDisposition, Observation};
 
@@ -130,37 +128,6 @@ fn observe_source<S: ElectricitySource<Target = Location> + ?Sized>(
     })
 }
 
-/// Single-thread schedule: skip missed intervals, and also detect sleep on clocks
-/// whose monotonic timer does not advance while the machine is suspended.
-pub struct Schedule {
-    interval: Duration,
-    next: Instant,
-    next_wall: i64,
-    last_wall: i64,
-}
-
-impl Schedule {
-    pub fn new(interval_seconds: u64, now: Instant, wall: i64) -> Self {
-        Self {
-            interval: Duration::from_secs(interval_seconds),
-            next: now,
-            next_wall: wall,
-            last_wall: wall,
-        }
-    }
-    pub fn due(&self, now: Instant, wall: i64) -> bool {
-        now >= self.next || wall >= self.next_wall || wall < self.last_wall
-    }
-    pub fn started(&mut self, now: Instant, wall: i64) {
-        self.next = now + self.interval;
-        self.next_wall = wall.saturating_add(self.interval.as_secs() as i64);
-        self.last_wall = wall;
-    }
-    pub fn next_wall(&self) -> i64 {
-        self.next_wall
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -180,20 +147,6 @@ mod tests {
             assert_eq!(Comparison::StrictlyBelow.low(remaining, threshold), strict);
             assert_eq!(Comparison::Inclusive.low(remaining, threshold), inclusive);
         }
-    }
-
-    #[test]
-    fn schedule_checks_immediately_skips_missed_intervals_and_handles_sleep() {
-        let now = Instant::now();
-        let mut schedule = Schedule::new(60, now, 1000);
-        assert!(schedule.due(now, 1000));
-        schedule.started(now, 1000);
-        assert!(!schedule.due(now + Duration::from_secs(59), 1059));
-        assert!(schedule.due(now + Duration::from_secs(1), 1200));
-        assert!(schedule.due(now + Duration::from_secs(1), 900));
-        schedule.started(now + Duration::from_secs(180), 1180);
-        assert!(!schedule.due(now + Duration::from_secs(180), 1180));
-        assert_eq!(schedule.next_wall(), 1240);
     }
 
     #[test]

@@ -6,12 +6,20 @@ use super::{
 };
 use chrono::Utc;
 use rust_decimal::Decimal;
-use std::{thread, time::Duration};
+use sdu_infohelper::monitor::{Cadence, Schedule};
+use std::{thread, time::Instant};
 
 pub(super) fn run(mut args: WatchArgs) -> Result<bool, String> {
     args.query.threshold.get_or_insert(Decimal::from(10));
     let history = super::history::open_for_write(&args.query.history)?;
+    let mut schedule = Schedule::with_cadence(
+        args.interval,
+        Instant::now(),
+        Utc::now().timestamp(),
+        Cadence::FinishToStart,
+    );
     loop {
+        schedule.started(Instant::now(), Utc::now().timestamp());
         let (event, fatal, auth) = event(&args.query);
         history.record(&event).map_err(|_| "无法写入查询记录。")?;
         print_event(&event, args.query.json);
@@ -58,7 +66,8 @@ pub(super) fn run(mut args: WatchArgs) -> Result<bool, String> {
         if fatal {
             return Ok(false);
         }
-        thread::sleep(Duration::from_secs(args.interval));
+        schedule.completed(Instant::now(), Utc::now().timestamp());
+        thread::sleep(schedule.remaining(Instant::now()));
     }
 }
 
